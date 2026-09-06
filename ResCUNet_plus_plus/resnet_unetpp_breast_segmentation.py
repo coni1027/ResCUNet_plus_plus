@@ -31,6 +31,47 @@ Masks are treated as binary: background=0, lesion=1 (or any value > 0).
 
 Important: create patient-level train/val/test splits BEFORE running this script,
 especially for MRI slices, so slices from the same patient do not leak across splits.
+
+Optional: Bayesian optimization for the hybrid loss weighting
+---------------------------------------------------------------
+Run with --tune-loss-weights to search for the balance between the BCE and
+Dice terms of the hybrid loss (bce_weight vs. dice_weight, expressed as a
+single alpha in [0, 1] with dice_weight = 1 - alpha) using Optuna's Bayesian
+optimizer (TPE sampler, the same family of method as scikit-optimize/GPyOpt).
+Install with: pip install optuna
+
+Please read these caveats before trusting the result of that search:
+
+1. Each trial retrains a FRESH model for a reduced number of epochs
+   (--tuning-epochs, default 5) instead of the full schedule, as a
+   compute-saving proxy. The alpha that looks best after 5 epochs is not
+   guaranteed to still be best after the full 30-epoch run -- treat the
+   tuned value as a good starting point, not a certified optimum, and
+   re-validate with a full training run.
+2. RIDER breast MRI has only 5 patients total, split 60/20/20 at the
+   patient level (3 train / 1 val / 1 test patients per section 3.2 of the
+   methodology). That means the validation Dice used as the optimization
+   objective for this modality comes from ONE patient's slices per trial.
+   A single-patient validation score is extremely high-variance and can
+   easily reward an alpha that happens to suit that one patient's lesion
+   size/contrast rather than the modality in general. Treat any MRI-side
+   "optimal" alpha as a rough estimate. If this matters for your thesis
+   results, prefer leave-one-patient-out cross-validation (loop the search
+   over which of the 5 patients is held out as "val") over a single fixed
+   split -- this script does not implement that for you.
+3. The same random seed re-initializes the model in every trial, so the
+   search isolates the effect of alpha rather than random-init noise. That
+   also means the result has only been checked for one seed; consider
+   re-running with 2-3 different seeds before trusting a close call,
+   especially on the small MRI split.
+4. This tunes only the BCE/Dice balance. It reuses whatever batch size,
+   learning rate, augmentation, and input resolution are already hard-coded
+   in each DatasetConfig -- those are not part of the search space here.
+5. Tuning and final-model checkpoint selection both read from the same
+   validation split. That's standard practice, but it means validation
+   performance is now "used twice" (once to pick alpha, once to pick the
+   best epoch) -- for a paper-grade generalization estimate, only the
+   held-out test metrics printed at the end should be reported.
 """
 
 from __future__ import annotations
@@ -54,6 +95,11 @@ try:
     import pydicom
 except ImportError:  # DICOM is optional unless .dcm files are used.
     pydicom = None
+
+try:
+    import optuna
+except ImportError:  # Optuna is optional unless --tune-loss-weights is used.
+    optuna = None
 
 
 # -----------------------------------------------------------------------------
@@ -119,7 +165,8 @@ class DatasetConfig:
     rotation_degrees: float = 15.0
     translation_fraction: float = 0.05
 
-    # Hybrid BCE + Dice loss weights
+    # Hybrid BCE + Dice loss weights (defaults; can be overridden by
+    # tune_bce_dice_weight() / train_one_dataset()'s bce_weight/dice_weight args)
     bce_weight: float = 0.5
     dice_weight: float = 0.5
 
@@ -145,6 +192,9 @@ MAMMOGRAM_CONFIG = DatasetConfig(
 
 # MRI slices are trained in their own experiment. These defaults are intentionally
 # independent from the mammogram settings.
+# NOTE: RIDER provides only 5 patients (see module docstring, point 2). Any
+# hyperparameter search run against MRI_CONFIG's validation split should be
+# read with that in mind.
 MRI_CONFIG = DatasetConfig(
     name="breast_mri",
     root=MRI_ROOT,
@@ -273,6 +323,13 @@ def preprocess_image(image: np.ndarray, config: DatasetConfig) -> np.ndarray:
     Returns HxW or CxHxW floating-point data in [0, 1].
 
     For multi-channel .npy MRI input, each channel is normalized independently.
+
+    NOTE: when clahe/median_filter is enabled, the [0,1] float image is
+    quantized to uint8 before CLAHE/median filtering (OpenCV requires 8-bit
+    input for these ops), then converted back to float. For 16-bit CBIS-DDSM
+    mammograms this discards most of the original bit depth in exchange for
+    CLAHE contrast enhancement -- a reasonable and common trade-off, but
+    worth stating explicitly if precision loss is ever questioned.
     """
     # Convert HWC NumPy arrays to CHW when they clearly contain channels.
     if image.ndim == 3 and image.shape[-1] <= 8 and image.shape[0] > 8:
@@ -655,6 +712,15 @@ class ResNetUNetPlusPlus(nn.Module):
         return outputs if self.deep_supervision else outputs[-1]
 
 
+def build_model(config: DatasetConfig) -> ResNetUNetPlusPlus:
+    """Shared model constructor so tuning and final training stay in sync."""
+    return ResNetUNetPlusPlus(
+        in_channels=config.in_channels,
+        pretrained_encoder=config.pretrained_encoder,
+        deep_supervision=config.deep_supervision,
+    ).to(DEVICE)
+
+
 # -----------------------------------------------------------------------------
 # Hybrid BCE + Dice loss
 # -----------------------------------------------------------------------------
@@ -782,6 +848,105 @@ def evaluate(
 
 
 # -----------------------------------------------------------------------------
+# Bayesian optimization for the BCE/Dice loss balance
+# -----------------------------------------------------------------------------
+
+def tune_bce_dice_weight(
+    config: DatasetConfig,
+    n_trials: int = 15,
+    tuning_epochs: int = 5,
+    timeout: int | None = None,
+) -> tuple[float, float]:
+    """
+    Bayesian-optimize the hybrid loss balance: bce_weight = alpha,
+    dice_weight = 1 - alpha, alpha in [0, 1].
+
+    Uses Optuna's TPE sampler (a sequential model-based / Bayesian optimizer)
+    to pick the next alpha to try based on all previous trials' results,
+    rather than a blind grid or random search. Each trial trains a fresh
+    model for `tuning_epochs` epochs and reports the resulting validation
+    Dice as the objective to maximize.
+
+    See the module docstring for important caveats -- in particular, this
+    search is a cheap proxy (short training runs) and, for the RIDER MRI
+    config, is evaluated against a single patient's slices.
+    """
+    if optuna is None:
+        raise ImportError(
+            "optuna is required for Bayesian optimization of the loss weights. "
+            "Install it with: pip install optuna"
+        )
+
+    if config.name == "breast_mri":
+        print(
+            "WARNING: tuning loss weights against the RIDER MRI validation "
+            "split. Only 5 patients exist in total (3 train / 1 val / 1 test "
+            "at the patient level), so this objective is computed from a "
+            "single patient's slices per trial. Treat the result as a rough "
+            "starting point -- consider leave-one-patient-out CV if you need "
+            "a trustworthy optimum for the thesis."
+        )
+
+    train_loader, val_loader, _ = create_loaders(config)
+
+    def objective(trial: "optuna.Trial") -> float:
+        alpha = trial.suggest_float("bce_weight", 0.0, 1.0)
+
+        # Fix the seed per trial so alpha's effect isn't confounded with a
+        # different random initialization (see docstring caveat 3).
+        set_seed(SEED)
+        model = build_model(config)
+
+        base_loss = BCEDiceLoss(bce_weight=alpha, dice_weight=1.0 - alpha)
+        criterion = DeepSupervisionLoss(base_loss)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        val_dice = 0.0
+        for epoch in range(1, tuning_epochs + 1):
+            model.train()
+            for images, masks in train_loader:
+                images = images.to(DEVICE, non_blocking=True)
+                masks = masks.to(DEVICE, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+                loss.backward()
+                optimizer.step()
+
+            val_metrics = evaluate(model, val_loader, criterion, DEVICE)
+            val_dice = val_metrics["dice"]
+
+            trial.report(val_dice, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return val_dice
+
+    sampler = optuna.samplers.TPESampler(seed=SEED)
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=2)
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+
+    print(
+        f"[{config.name}] Starting Bayesian optimization: {n_trials} trials x "
+        f"{tuning_epochs} epochs each..."
+    )
+    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+
+    best_alpha = study.best_params["bce_weight"]
+    print(
+        f"[{config.name}] Best alpha (bce_weight) found: {best_alpha:.4f} "
+        f"(dice_weight={1.0 - best_alpha:.4f}) -> val_dice={study.best_value:.4f} "
+        f"over {len(study.trials)} trials"
+    )
+    return best_alpha, 1.0 - best_alpha
+
+
+# -----------------------------------------------------------------------------
 # Training and checkpoints
 # -----------------------------------------------------------------------------
 
@@ -792,6 +957,8 @@ def save_checkpoint(
     epoch: int,
     best_val_dice: float,
     config: DatasetConfig,
+    bce_weight: float,
+    dice_weight: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -806,6 +973,8 @@ def save_checkpoint(
             "encoder": "resnet34",
             "architecture": "unet++",
             "deep_supervision": config.deep_supervision,
+            "bce_weight": bce_weight,
+            "dice_weight": dice_weight,
         },
         path,
     )
@@ -821,19 +990,28 @@ def write_history(path: Path, history: list[dict[str, float]]) -> None:
         writer.writerows(history)
 
 
-def train_one_dataset(config: DatasetConfig) -> dict[str, float]:
-    """Train a completely separate ResNet-U-Net++ model for one modality."""
+def train_one_dataset(
+    config: DatasetConfig,
+    bce_weight: float | None = None,
+    dice_weight: float | None = None,
+) -> dict[str, float]:
+    """
+    Train a completely separate ResNet-U-Net++ model for one modality.
+
+    bce_weight / dice_weight override the DatasetConfig defaults when given --
+    this is how the Bayesian-optimized weights from tune_bce_dice_weight()
+    get plugged into the full training run.
+    """
     set_seed(SEED)
+
+    resolved_bce_weight = config.bce_weight if bce_weight is None else bce_weight
+    resolved_dice_weight = config.dice_weight if dice_weight is None else dice_weight
 
     train_loader, val_loader, test_loader = create_loaders(config)
 
-    model = ResNetUNetPlusPlus(
-        in_channels=config.in_channels,
-        pretrained_encoder=config.pretrained_encoder,
-        deep_supervision=config.deep_supervision,
-    ).to(DEVICE)
+    model = build_model(config)
 
-    base_loss = BCEDiceLoss(config.bce_weight, config.dice_weight)
+    base_loss = BCEDiceLoss(resolved_bce_weight, resolved_dice_weight)
     criterion = DeepSupervisionLoss(base_loss)
 
     optimizer = optim.AdamW(
@@ -859,6 +1037,10 @@ def train_one_dataset(config: DatasetConfig) -> dict[str, float]:
     print(f"Training: {config.name} | ResNet34 encoder + U-Net++")
     print(f"Device: {DEVICE}")
     print(f"Input size: {config.input_size} | batch size: {config.batch_size}")
+    print(
+        f"Loss weights -> bce_weight={resolved_bce_weight:.4f}, "
+        f"dice_weight={resolved_dice_weight:.4f}"
+    )
     print("=" * 80)
 
     for epoch in range(1, config.epochs + 1):
@@ -914,6 +1096,8 @@ def train_one_dataset(config: DatasetConfig) -> dict[str, float]:
                 epoch,
                 best_val_dice,
                 config,
+                resolved_bce_weight,
+                resolved_dice_weight,
             )
             print(f"  Saved new best checkpoint: {checkpoint_path}")
 
@@ -944,7 +1128,43 @@ def parse_args() -> argparse.Namespace:
         default="both",
         help="Which modality to train. Default: both (sequentially).",
     )
+    parser.add_argument(
+        "--tune-loss-weights",
+        action="store_true",
+        help=(
+            "Run Bayesian optimization (Optuna TPE) over the BCE/Dice loss "
+            "balance before training each selected dataset. Requires "
+            "'pip install optuna'. See the module docstring for caveats, "
+            "especially regarding the small RIDER MRI split."
+        ),
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=15,
+        help="Number of Optuna trials when --tune-loss-weights is set (default: 15).",
+    )
+    parser.add_argument(
+        "--tuning-epochs",
+        type=int,
+        default=5,
+        help=(
+            "Epochs trained per trial during loss-weight tuning (default: 5). "
+            "Kept short on purpose as a cheap proxy -- see module docstring."
+        ),
+    )
     return parser.parse_args()
+
+
+def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> None:
+    bce_weight = dice_weight = None
+    if args.tune_loss_weights:
+        bce_weight, dice_weight = tune_bce_dice_weight(
+            config,
+            n_trials=args.n_trials,
+            tuning_epochs=args.tuning_epochs,
+        )
+    train_one_dataset(config, bce_weight=bce_weight, dice_weight=dice_weight)
 
 
 def main() -> None:
@@ -956,10 +1176,10 @@ def main() -> None:
         print("GPU:", torch.cuda.get_device_name(0))
 
     if args.dataset in ("mammogram", "both"):
-        train_one_dataset(MAMMOGRAM_CONFIG)
+        run_dataset(MAMMOGRAM_CONFIG, args)
 
     if args.dataset in ("mri", "both"):
-        train_one_dataset(MRI_CONFIG)
+        run_dataset(MRI_CONFIG, args)
 
 
 if __name__ == "__main__":
