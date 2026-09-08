@@ -62,38 +62,59 @@ single alpha in [0, 1] with dice_weight = 1 - alpha) using Optuna's Bayesian
 optimizer (TPE sampler, the same family of method as scikit-optimize/GPyOpt).
 Install with: pip install optuna
 
+Each trial is now scored with K-fold cross-validation (--cv-folds, default
+5) over the pooled train+val samples, instead of a single fixed split: for
+every fold, a fresh model trains for --tuning-epochs epochs on that fold's
+train side and is evaluated on its held-out side, and the trial's objective
+is the MEAN validation Dice across folds. The `test` split is never touched
+by tuning. Run with --show-cv-groups to preview the fold assignment for
+free before committing to a full tuning run.
+
 Please read these caveats before trusting the result of that search:
 
-1. Each trial retrains a FRESH model for a reduced number of epochs
-   (--tuning-epochs, default 5) instead of the full schedule, as a
-   compute-saving proxy. The alpha that looks best after 5 epochs is not
-   guaranteed to still be best after the full 30-epoch run -- treat the
-   tuned value as a good starting point, not a certified optimum, and
+1. Each trial still retrains FRESH models for a reduced number of epochs
+   per fold (--tuning-epochs, default 5) instead of the full schedule, as a
+   compute-saving proxy. The alpha that looks best after a few short epochs
+   is not guaranteed to still be best after the full 30-epoch run -- treat
+   the tuned value as a good starting point, not a certified optimum, and
    re-validate with a full training run.
-2. RIDER breast MRI has only 5 patients total, split 60/20/20 at the
-   patient level (3 train / 1 val / 1 test patients per section 3.2 of the
-   methodology). That means the validation Dice used as the optimization
-   objective for this modality comes from ONE patient's slices per trial.
-   A single-patient validation score is extremely high-variance and can
-   easily reward an alpha that happens to suit that one patient's lesion
-   size/contrast rather than the modality in general. Treat any MRI-side
-   "optimal" alpha as a rough estimate. If this matters for your thesis
-   results, prefer leave-one-patient-out cross-validation (loop the search
-   over which of the 5 patients is held out as "val") over a single fixed
-   split -- this script does not implement that for you.
-3. The same random seed re-initializes the model in every trial, so the
-   search isolates the effect of alpha rather than random-init noise. That
-   also means the result has only been checked for one seed; consider
-   re-running with 2-3 different seeds before trusting a close call,
-   especially on the small MRI split.
-4. This tunes only the BCE/Dice balance. It reuses whatever batch size,
+2. Folds are only patient-safe -- i.e. no patient's slices land on both
+   sides of a fold -- if you set DatasetConfig.patient_id_fn to a function
+   that correctly maps an image Path to a patient/case ID for YOUR exported
+   filenames (default_patient_id_from_filename is a best-effort starting
+   point, not a validated parser for your files). Leave it unset and
+   tune_bce_dice_weight() will build folds per SLICE instead, and will
+   print a loud warning for breast_mri, since section 3.2 of the
+   methodology requires RIDER splits at the patient level. Verify with
+   --show-cv-groups before trusting grouped folds.
+3. Even with correct patient grouping, RIDER has only 5 patients total
+   (60/20/20 patient-level split per section 3.2, so at most 4 patients are
+   ever pooled into train+val here -- 1 is permanently held out for test).
+   That caps RIDER's CV at 4-fold (leave-one-patient-out): a real
+   improvement over a single patient's validation score, but still a
+   small-N estimate -- treat any MRI-side "optimal" alpha as a rough one.
+4. Cross-validation multiplies compute roughly (n_trials x cv_folds x
+   tuning_epochs) instead of (n_trials x tuning_epochs) -- several times
+   the runtime of the old single-split search, especially for the 512x512
+   mammogram config. The MedianPruner still cuts unpromising trials short,
+   but now between folds rather than between epochs (a trial can't be
+   pruned mid-fold, only after completing at least two full folds). Lower
+   --n-trials, --tuning-epochs, or --cv-folds if the cost is prohibitive.
+5. The same random seed re-initializes the model at the start of every
+   fold of every trial, so the search isolates the effect of alpha (and
+   each fold's data) rather than random-init noise. The result has still
+   only been checked for one seed; consider re-running with 2-3 different
+   seeds before trusting a close call.
+6. This tunes only the BCE/Dice balance. It reuses whatever batch size,
    learning rate, augmentation, and input resolution are already hard-coded
    in each DatasetConfig -- those are not part of the search space here.
-5. Tuning and final-model checkpoint selection both read from the same
-   validation split. That's standard practice, but it means validation
-   performance is now "used twice" (once to pick alpha, once to pick the
-   best epoch) -- for a paper-grade generalization estimate, only the
-   held-out test metrics printed at the end should be reported.
+7. Tuning's CV folds and the final training run's fixed val split both
+   ultimately come from the same train+val pool, and the final run's
+   checkpoint selection still reads that same fixed val split. That's
+   standard practice, but it means validation data is "used twice" (once,
+   across fold combinations, to pick alpha; once, whole, to pick the best
+   epoch) -- for a paper-grade generalization estimate, only the held-out
+   test metrics printed at the end should be reported.
 """
 
 from __future__ import annotations
@@ -101,16 +122,17 @@ from __future__ import annotations
 import argparse
 import csv
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import cv2
 import numpy as np
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.models import ResNet34_Weights, resnet34
 
 try:
@@ -192,9 +214,23 @@ class DatasetConfig:
     bce_weight: float = 0.5
     dice_weight: float = 0.5
 
+    # Optional grouping hook for cross-validation during --tune-loss-weights
+    # (see tune_bce_dice_weight / make_group_folds). Given an image Path,
+    # return a string group ID -- typically a patient ID -- so every slice
+    # from the same patient/case lands in the same CV fold. Leave as None
+    # to fall back to per-sample folds; tune_bce_dice_weight() prints a
+    # warning when that happens for breast_mri, since methodology section
+    # 3.2 requires RIDER splits at the patient level.
+    patient_id_fn: Callable[[Path], str] | None = None
+
 
 # Mammograms retain more spatial detail, so this default uses 512x512.
 # Reduce to (256, 256) if GPU memory is limited.
+# NOTE: CBIS-DDSM patients can contribute multiple images (views/lesions).
+# The methodology's patient-level split requirement (section 3.2) is
+# specific to RIDER, but the same leakage risk can apply here during
+# --tune-loss-weights -- set patient_id_fn below if you want CV folds to
+# be patient-safe for mammograms too.
 MAMMOGRAM_CONFIG = DatasetConfig(
     name="mammogram",
     root=MAMMOGRAM_ROOT,
@@ -214,9 +250,11 @@ MAMMOGRAM_CONFIG = DatasetConfig(
 
 # MRI slices are trained in their own experiment. These defaults are intentionally
 # independent from the mammogram settings.
-# NOTE: RIDER provides only 5 patients (see module docstring, point 2). Any
-# hyperparameter search run against MRI_CONFIG's validation split should be
-# read with that in mind.
+# NOTE: RIDER provides only 5 patients (see module docstring, points 2-3).
+# For --tune-loss-weights to build patient-safe CV folds (rather than
+# per-slice folds), set patient_id_fn below, e.g.:
+#   MRI_CONFIG.patient_id_fn = default_patient_id_from_filename
+# and verify the grouping with --show-cv-groups before trusting the result.
 MRI_CONFIG = DatasetConfig(
     name="breast_mri",
     root=MRI_ROOT,
@@ -484,27 +522,49 @@ class BreastSegmentationDataset(Dataset):
     def __init__(
         self,
         config: DatasetConfig,
-        split: str,
-        augment: bool,
+        split: str | None = None,
+        augment: bool = False,
+        samples: list[tuple[Path, Path]] | None = None,
     ) -> None:
+        """
+        Two ways to build this dataset:
+          - split-based (original behaviour): pass `split` ("train"/"val"/
+            "test") and samples are read from config.root/<split>/{images,masks}.
+          - explicit `samples` list: used by the cross-validation code in
+            tune_bce_dice_weight(), which pools train+val samples and then
+            slices them into folds. `samples` bypasses the on-disk split
+            lookup entirely, so the same pooled list can back both an
+            augmented view (train side of a fold) and a plain view (val
+            side) via torch.utils.data.Subset.
+        """
         super().__init__()
         self.config = config
         self.split = split
         self.augment = augment
 
-        split_dir = config.root / split
-        self.images_dir = split_dir / "images"
-        self.masks_dir = split_dir / "masks"
+        if samples is not None:
+            self.images_dir = None
+            self.masks_dir = None
+            self.samples = samples
+        else:
+            if split is None:
+                raise ValueError("BreastSegmentationDataset needs either `split` or `samples`.")
 
-        if not self.images_dir.exists() or not self.masks_dir.exists():
-            raise FileNotFoundError(
-                f"Missing {config.name} split: {split_dir}\n"
-                "Expected <split>/images and <split>/masks directories."
-            )
+            split_dir = config.root / split
+            self.images_dir = split_dir / "images"
+            self.masks_dir = split_dir / "masks"
 
-        self.samples = paired_samples(self.images_dir, self.masks_dir)
+            if not self.images_dir.exists() or not self.masks_dir.exists():
+                raise FileNotFoundError(
+                    f"Missing {config.name} split: {split_dir}\n"
+                    "Expected <split>/images and <split>/masks directories."
+                )
+
+            self.samples = paired_samples(self.images_dir, self.masks_dir)
+
         if not self.samples:
-            raise ValueError(f"No paired samples found in {split_dir}")
+            where = f"split={split!r}" if samples is None else "the provided sample list"
+            raise ValueError(f"No paired samples found for {config.name} ({where})")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -557,6 +617,35 @@ def create_loaders(config: DatasetConfig) -> tuple[DataLoader, DataLoader, DataL
     )
 
     return train_loader, val_loader, test_loader
+
+
+def pooled_trainval_samples(config: DatasetConfig) -> list[tuple[Path, Path]]:
+    """
+    Combine the `train` and `val` split samples into one pool for
+    cross-validated loss-weight tuning (see tune_bce_dice_weight). The
+    `test` split is deliberately excluded here and stays held out for the
+    final, once-only evaluation in train_one_dataset -- CV folds are only
+    ever carved out of data that was already earmarked for
+    training/tuning under the methodology's train/val/test split.
+    """
+    samples: list[tuple[Path, Path]] = []
+    for split in ("train", "val"):
+        split_dir = config.root / split
+        images_dir = split_dir / "images"
+        masks_dir = split_dir / "masks"
+
+        if not images_dir.exists() or not masks_dir.exists():
+            raise FileNotFoundError(
+                f"Missing {config.name} split: {split_dir}\n"
+                "Expected <split>/images and <split>/masks directories."
+            )
+
+        samples.extend(paired_samples(images_dir, masks_dir))
+
+    if not samples:
+        raise ValueError(f"No paired train+val samples found for {config.name}.")
+
+    return samples
 
 
 # -----------------------------------------------------------------------------
@@ -958,6 +1047,100 @@ def evaluate(
 
 
 # -----------------------------------------------------------------------------
+# Cross-validation utilities for Bayesian loss-weight tuning
+# -----------------------------------------------------------------------------
+
+_PATIENT_ID_PATTERN = re.compile(
+    r"(?P<patient>P[_-]?\d{3,}|RIDER[\s_-]?[A-Za-z0-9]+[_-]?\d+|\d{3,})",
+    re.IGNORECASE,
+)
+
+
+def default_patient_id_from_filename(image_path: Path) -> str:
+    """
+    Best-effort patient/case ID guess from a filename -- a starting point
+    for grouped (patient-safe) CV folds, NOT a validated parser for CBIS-
+    DDSM's or your exported RIDER files' actual naming convention.
+
+    Intended to handle filenames along the lines of:
+      "Mass-Training_P_00016_LEFT_CC_1.png" -> "P_00016"
+      "RIDER-1023_slice014.png"             -> "RIDER-1023"
+      "1023_042.png"                        -> "1023"
+
+    VERIFY this against your real filenames (e.g. via --show-cv-groups)
+    before trusting grouped folds. If it can't find a match it falls back
+    to the full filename stem, which is equivalent to no grouping at all
+    for that one file -- silently defeating patient-level separation for
+    it, so a mismatch here won't necessarily raise an error.
+    """
+    match = _PATIENT_ID_PATTERN.search(image_path.stem)
+    return match.group("patient") if match else image_path.stem
+
+
+def make_group_folds(
+    n_samples: int,
+    n_folds: int,
+    seed: int,
+    groups: Sequence[str] | None = None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Partition `n_samples` sample indices into up to `n_folds` (train_idx,
+    val_idx) pairs for cross-validation -- a hand-rolled equivalent of
+    sklearn.model_selection.GroupKFold, written here to avoid adding
+    scikit-learn as a dependency just for this.
+
+    If `groups` is given (e.g. one patient ID per sample), every sample
+    sharing the same group value is guaranteed to land in the same fold --
+    this is what keeps a patient's slices from being split across the
+    train/val sides of a fold. Fold sizes are balanced by total SAMPLE
+    count (via a greedy fill-the-smallest-fold assignment), not just group
+    count, since group sizes (slices per patient) can differ a lot. If
+    `groups` is None, each sample is its own group (ordinary per-sample
+    K-fold) -- fine for i.i.d. data, but not patient-safe for RIDER.
+
+    Uses its own seeded numpy Generator, independent of the global
+    torch/numpy/random seed set by set_seed(), so fold assignment is fixed
+    once per tuning run regardless of how often set_seed() is called later
+    for model re-initialization.
+
+    Returns fewer than `n_folds` folds if fewer than `n_folds` unique
+    groups exist (e.g. RIDER's ~4 non-test patients) -- this is how
+    leave-one-patient-out CV naturally falls out of a generic "K-fold"
+    request once grouping is enabled.
+    """
+    if groups is not None and len(groups) != n_samples:
+        raise ValueError(
+            f"groups has length {len(groups)}, expected {n_samples} (one per sample)."
+        )
+
+    rng = np.random.default_rng(seed)
+    group_ids = np.arange(n_samples) if groups is None else np.asarray(groups)
+
+    unique_groups = np.unique(group_ids)
+    rng.shuffle(unique_groups)
+
+    effective_folds = max(1, min(n_folds, len(unique_groups)))
+
+    fold_sample_indices: list[list[int]] = [[] for _ in range(effective_folds)]
+    fold_sizes = [0] * effective_folds
+
+    for group in unique_groups:
+        member_indices = np.where(group_ids == group)[0]
+        target_fold = int(np.argmin(fold_sizes))
+        fold_sample_indices[target_fold].extend(member_indices.tolist())
+        fold_sizes[target_fold] += len(member_indices)
+
+    all_indices = np.arange(n_samples)
+    folds: list[tuple[np.ndarray, np.ndarray]] = []
+    for fold in fold_sample_indices:
+        val_idx = np.array(sorted(fold))
+        train_idx = np.setdiff1d(all_indices, val_idx, assume_unique=True)
+        folds.append((train_idx, val_idx))
+
+    return folds
+
+
+# -----------------------------------------------------------------------------
 # Bayesian optimization for the BCE/Dice loss balance
 # -----------------------------------------------------------------------------
 
@@ -965,6 +1148,7 @@ def tune_bce_dice_weight(
     config: DatasetConfig,
     n_trials: int = 15,
     tuning_epochs: int = 5,
+    n_folds: int = 5,
     timeout: int | None = None,
 ) -> tuple[float, float]:
     """
@@ -973,13 +1157,21 @@ def tune_bce_dice_weight(
 
     Uses Optuna's TPE sampler (a sequential model-based / Bayesian optimizer)
     to pick the next alpha to try based on all previous trials' results,
-    rather than a blind grid or random search. Each trial trains a fresh
-    model for `tuning_epochs` epochs and reports the resulting validation
-    Dice as the objective to maximize.
+    rather than a blind grid or random search.
 
-    See the module docstring for important caveats -- in particular, this
-    search is a cheap proxy (short training runs) and, for the RIDER MRI
-    config, is evaluated against a single patient's slices.
+    Each trial now cross-validates over `n_folds` folds carved out of the
+    pooled train+val samples (see pooled_trainval_samples), instead of a
+    single fixed train/val split: for every fold, a fresh model trains for
+    `tuning_epochs` epochs on that fold's train side and is scored on its
+    val side, and the trial's objective is the MEAN validation Dice across
+    folds. Folds are grouped by config.patient_id_fn when set, so that (for
+    example) all of one RIDER patient's slices stay together on one side
+    of every fold -- see make_group_folds().
+
+    See the module docstring for full caveats -- in particular, this
+    search is still a cheap proxy (short training runs) and, unless
+    config.patient_id_fn is set, folds are NOT guaranteed to respect
+    patient boundaries.
     """
     if optuna is None:
         raise ImportError(
@@ -987,73 +1179,177 @@ def tune_bce_dice_weight(
             "Install it with: pip install optuna"
         )
 
-    if config.name == "breast_mri":
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2 for cross-validation; got {n_folds}.")
+
+    samples = pooled_trainval_samples(config)
+    n_samples = len(samples)
+
+    groups: list[str] | None = None
+    if config.patient_id_fn is not None:
+        groups = [config.patient_id_fn(image_path) for image_path, _ in samples]
         print(
-            "WARNING: tuning loss weights against the RIDER MRI validation "
-            "split. Only 5 patients exist in total (3 train / 1 val / 1 test "
-            "at the patient level), so this objective is computed from a "
-            "single patient's slices per trial. Treat the result as a rough "
-            "starting point -- consider leave-one-patient-out CV if you need "
-            "a trustworthy optimum for the thesis."
+            f"[{config.name}] Grouping {n_samples} pooled train+val samples "
+            f"into {len(set(groups))} group(s) via {config.patient_id_fn.__name__} "
+            "for cross-validation."
+        )
+    elif config.name == "breast_mri":
+        print(
+            "WARNING: MRI_CONFIG.patient_id_fn is not set, so breast_mri CV "
+            "folds will be built per SLICE, not per patient. Section 3.2 of "
+            "the methodology requires RIDER splits at the patient level -- "
+            "without grouping, slices from the same patient can end up on "
+            "both sides of a fold, which will make validation Dice look "
+            "better than it would on a truly unseen patient. Set "
+            "MRI_CONFIG.patient_id_fn to a function mapping an image Path "
+            "to a patient ID (see default_patient_id_from_filename for a "
+            "starting point) and re-check with --show-cv-groups before "
+            "trusting these results."
         )
 
-    train_loader, val_loader, _ = create_loaders(config)
+    folds = make_group_folds(n_samples, n_folds, seed=SEED, groups=groups)
+    effective_folds = len(folds)
+    if effective_folds < n_folds:
+        print(
+            f"[{config.name}] Requested {n_folds} folds but only "
+            f"{effective_folds} unique group(s) are available in the pooled "
+            f"train+val data; using {effective_folds}-fold cross-validation."
+        )
+
+    if config.name == "breast_mri":
+        print(
+            "NOTE: RIDER has only 5 patients total (60/20/20 patient-level "
+            "split per section 3.2 -> at most 4 patients ever land in the "
+            "train+val pool used here, 1 is permanently held out for test). "
+            "Even with correct patient grouping this caps CV at 4-fold "
+            "(leave-one-patient-out) -- a real improvement over a single "
+            "patient's validation score, but still a small-N estimate."
+        )
+
+    augmented_view = BreastSegmentationDataset(config, augment=True, samples=samples)
+    plain_view = BreastSegmentationDataset(config, augment=False, samples=samples)
+
+    loader_kwargs = {
+        "batch_size": config.batch_size,
+        "num_workers": NUM_WORKERS,
+        "pin_memory": DEVICE.type == "cuda",
+    }
 
     def objective(trial: "optuna.Trial") -> float:
         alpha = trial.suggest_float("bce_weight", 0.0, 1.0)
+        fold_dices: list[float] = []
 
-        # Fix the seed per trial so alpha's effect isn't confounded with a
-        # different random initialization (see docstring caveat 3).
-        set_seed(SEED)
-        model = build_model(config)
+        for fold_idx, (train_idx, val_idx) in enumerate(folds):
+            # Reset the seed at the start of every fold (not just once per
+            # trial) so model init is controlled the same way across
+            # folds, isolating the effect of alpha and each fold's data.
+            set_seed(SEED)
+            model = build_model(config)
 
-        base_loss = BCEDiceLoss(bce_weight=alpha, dice_weight=1.0 - alpha)
-        criterion = DeepSupervisionLoss(base_loss)
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
+            base_loss = BCEDiceLoss(bce_weight=alpha, dice_weight=1.0 - alpha)
+            criterion = DeepSupervisionLoss(base_loss)
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
 
-        val_dice = 0.0
-        for epoch in range(1, tuning_epochs + 1):
-            model.train()
-            for images, masks in train_loader:
-                images = images.to(DEVICE, non_blocking=True)
-                masks = masks.to(DEVICE, non_blocking=True)
+            fold_train_loader = DataLoader(
+                Subset(augmented_view, train_idx), shuffle=True, **loader_kwargs
+            )
+            fold_val_loader = DataLoader(
+                Subset(plain_view, val_idx), shuffle=False, **loader_kwargs
+            )
 
-                optimizer.zero_grad(set_to_none=True)
-                outputs = model(images)
-                loss = criterion(outputs, masks)
-                loss.backward()
-                optimizer.step()
+            fold_val_dice = 0.0
+            for _epoch in range(1, tuning_epochs + 1):
+                model.train()
+                for images, masks in fold_train_loader:
+                    images = images.to(DEVICE, non_blocking=True)
+                    masks = masks.to(DEVICE, non_blocking=True)
 
-            val_metrics = evaluate(model, val_loader, criterion, DEVICE)
-            val_dice = val_metrics["dice"]
+                    optimizer.zero_grad(set_to_none=True)
+                    outputs = model(images)
+                    loss = criterion(outputs, masks)
+                    loss.backward()
+                    optimizer.step()
 
-            trial.report(val_dice, epoch)
+                val_metrics = evaluate(model, fold_val_loader, criterion, DEVICE)
+                fold_val_dice = val_metrics["dice"]
+
+            fold_dices.append(fold_val_dice)
+
+            # Report/prune between folds rather than between epochs -- a
+            # trial can now only be pruned after completing at least
+            # `n_warmup_steps + 1` full folds (see MedianPruner below).
+            running_mean_dice = float(np.mean(fold_dices))
+            trial.report(running_mean_dice, step=fold_idx)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-        return val_dice
+        return float(np.mean(fold_dices))
 
     sampler = optuna.samplers.TPESampler(seed=SEED)
-    pruner = optuna.pruners.MedianPruner(n_warmup_steps=2)
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=1)
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
 
+    total_epoch_equivalents = n_trials * effective_folds * tuning_epochs
     print(
         f"[{config.name}] Starting Bayesian optimization: {n_trials} trials x "
-        f"{tuning_epochs} epochs each..."
+        f"{effective_folds} folds x {tuning_epochs} epochs = up to "
+        f"{total_epoch_equivalents} epoch-equivalents before pruning "
+        "(MedianPruner will cut many unpromising trials short)..."
     )
     study.optimize(objective, n_trials=n_trials, timeout=timeout)
 
     best_alpha = study.best_params["bce_weight"]
     print(
         f"[{config.name}] Best alpha (bce_weight) found: {best_alpha:.4f} "
-        f"(dice_weight={1.0 - best_alpha:.4f}) -> val_dice={study.best_value:.4f} "
-        f"over {len(study.trials)} trials"
+        f"(dice_weight={1.0 - best_alpha:.4f}) -> "
+        f"mean_cv_val_dice={study.best_value:.4f} over {effective_folds} folds, "
+        f"{len(study.trials)} trials"
     )
     return best_alpha, 1.0 - best_alpha
+
+
+def preview_cv_groups(config: DatasetConfig, n_folds: int) -> None:
+    """
+    Print how pooled train+val samples would be grouped and split into CV
+    folds, WITHOUT training anything -- a cheap sanity check for
+    config.patient_id_fn (or the lack of one) before committing GPU time
+    to --tune-loss-weights. Triggered by --show-cv-groups.
+    """
+    samples = pooled_trainval_samples(config)
+    n_samples = len(samples)
+
+    groups: list[str] | None = None
+    if config.patient_id_fn is not None:
+        groups = [config.patient_id_fn(image_path) for image_path, _ in samples]
+
+    folds = make_group_folds(n_samples, n_folds, seed=SEED, groups=groups)
+
+    print(f"\n[{config.name}] Pooled train+val samples: {n_samples}")
+    if groups is not None:
+        unique = sorted(set(groups))
+        print(f"[{config.name}] {len(unique)} group(s) via {config.patient_id_fn.__name__}: {unique}")
+    else:
+        print(
+            f"[{config.name}] No patient_id_fn set -- grouping is per-sample "
+            "(ordinary K-fold, NOT patient-safe)."
+        )
+
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        if groups is not None:
+            val_groups = sorted({groups[i] for i in val_idx})
+            print(
+                f"  Fold {fold_idx}: train={len(train_idx)} samples, "
+                f"val={len(val_idx)} samples, val_groups={val_groups}"
+            )
+        else:
+            print(
+                f"  Fold {fold_idx}: train={len(train_idx)} samples, "
+                f"val={len(val_idx)} samples"
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -1435,9 +1731,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Run Bayesian optimization (Optuna TPE) over the BCE/Dice loss "
-            "balance before training each selected dataset. Requires "
-            "'pip install optuna'. See the module docstring for caveats, "
-            "especially regarding the small RIDER MRI split."
+            "balance before training each selected dataset, cross-validated "
+            "over --cv-folds folds of the pooled train+val data (see "
+            "--cv-folds). Requires 'pip install optuna'. See the module "
+            "docstring for caveats, especially regarding patient grouping "
+            "for the small RIDER MRI split."
         ),
     )
     parser.add_argument(
@@ -1451,8 +1749,32 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help=(
-            "Epochs trained per trial during loss-weight tuning (default: 5). "
-            "Kept short on purpose as a cheap proxy -- see module docstring."
+            "Epochs trained per trial (per fold) during loss-weight tuning "
+            "(default: 5). Kept short on purpose as a cheap proxy -- see "
+            "module docstring."
+        ),
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=5,
+        help=(
+            "Number of cross-validation folds used when --tune-loss-weights "
+            "is set (default: 5). Each trial's objective is the mean "
+            "validation Dice across this many folds of the pooled train+val "
+            "data, instead of one fixed split. Automatically reduced if "
+            "fewer unique groups exist (e.g. RIDER's ~4 non-test patients "
+            "when DatasetConfig.patient_id_fn is set)."
+        ),
+    )
+    parser.add_argument(
+        "--show-cv-groups",
+        action="store_true",
+        help=(
+            "Print the pooled train+val sample counts and CV fold/group "
+            "assignment for the selected dataset(s) and exit -- no training "
+            "or tuning. Use this to sanity-check patient grouping (or the "
+            "lack of it) before running --tune-loss-weights."
         ),
     )
     parser.add_argument(
@@ -1475,6 +1797,7 @@ def run_dataset(config: DatasetConfig, args: argparse.Namespace) -> None:
             config,
             n_trials=args.n_trials,
             tuning_epochs=args.tuning_epochs,
+            n_folds=args.cv_folds,
         )
     train_one_dataset(config, bce_weight=bce_weight, dice_weight=dice_weight)
 
@@ -1489,6 +1812,13 @@ def main() -> None:
 
     if args.diagram:
         save_architecture_diagram(RESULTS_DIR / "architecture_diagram.png")
+        return
+
+    if args.show_cv_groups:
+        if args.dataset in ("mammogram", "both"):
+            preview_cv_groups(MAMMOGRAM_CONFIG, args.cv_folds)
+        if args.dataset in ("mri", "both"):
+            preview_cv_groups(MRI_CONFIG, args.cv_folds)
         return
 
     if args.dataset in ("mammogram", "both"):
