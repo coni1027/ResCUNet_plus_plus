@@ -694,3 +694,14 @@ To run RIDER:
 python experiments/run_kfold_cv.py --dataset mri --models resunetpp_cbam --n-folds 4
 ```
 **!!MAKE SURE TO REMOVE FILES UNDER RESULTS AND CHECKPOINTS FOLDERS IN PROJECT FOLDER BEFORE RUNNING!!**
+
+More to RIDER in case data gets removed since its large (to make it replicable)
+- First step: Dry run, checks if dataset is found
+```bash
+python preprocessing\prepare_mri_presplit.py --raw-root data\raw\breast_mri --dry-run
+```
+- Second step: Ready the slices
+```bash
+python preprocessing\prepare_mri_presplit.py --raw-root data\raw\breast_mri
+python -c "from config import MRI_CONFIG; from cross_validation.folds import default_patient_id_from_filename, preview_cv_groups; MRI_CONFIG.patient_id_fn = default_patient_id_from_filename; preview_cv_groups(MRI_CONFIG, 4)"
+```
