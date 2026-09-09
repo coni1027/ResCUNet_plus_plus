@@ -687,3 +687,10 @@ python resnet_unetpp_breast_segmentation.py --help
 ```
 
 to display the available command-line options.
+
+
+To run RIDER:
+```bash
+python experiments/run_kfold_cv.py --dataset mri --models resunetpp_cbam --n-folds 4
+```
+**!!MAKE SURE TO REMOVE FILES UNDER RESULTS AND CHECKPOINTS FOLDERS IN PROJECT FOLDER BEFORE RUNNING!!**
