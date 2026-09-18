@@ -103,11 +103,12 @@ class DatasetConfig:
 
 # Mammograms retain more spatial detail, so this default uses 512x512.
 # Reduce to (256, 256) if GPU memory is limited.
-# NOTE: CBIS-DDSM patients can contribute multiple images (views/lesions).
-# The methodology's patient-level split requirement (section 3.2) is
-# specific to RIDER, but the same leakage risk can apply here during
-# Bayesian loss-weight tuning -- set patient_id_fn below if you want CV
-# folds to be patient-safe for mammograms too.
+# NOTE: CBIS-DDSM patients can contribute multiple images (views/lesions),
+# e.g. "P_00001_LEFT_CC" and "P_00001_LEFT_MLO" are the same patient.
+# experiments/run_all.py sets patient_id_fn = default_patient_id_from_
+# filename for this config too, so CV folds are patient-safe here as
+# well as for MRI -- verified against the actual "<patient>_<side>_
+# <view>" export this project uses (see prepare_mammograms_presplit.py).
 MAMMOGRAM_CONFIG = DatasetConfig(
     name="mammogram",
     root=MAMMOGRAM_ROOT,

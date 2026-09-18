@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 
 # Large/generated data and artifacts (transfer separately, don't commit)
+project/data/mammogram/
 project/data/mammograms/
 project/data/raw/
 project/checkpoints/

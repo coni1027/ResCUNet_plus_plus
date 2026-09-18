@@ -72,12 +72,15 @@ from training.trainer import train_model
 from tuning import DEFAULT_TUNING_METHOD, TUNING_METHODS, tune_loss_weights
 from tuning.grid_search import DEFAULT_ALPHAS
 
-# Enable patient-safe CV grouping for RIDER by default in the full
-# pipeline (see module docstring above for how to verify this first).
-# Mammogram grouping is left opt-in -- see config.py's comment on
-# MAMMOGRAM_CONFIG -- since CBIS-DDSM's filename convention hasn't been
-# checked against default_patient_id_from_filename for this project.
+# Enable patient-safe CV grouping by default in the full pipeline (see
+# module docstring above for how to verify this first). Verified for
+# both datasets' actual filenames: MRI against RIDER's exported slice
+# names, and mammogram against preprocessing/prepare_mammograms_presplit
+# .py's "<patient>_<side>_<view>.npy" output (e.g. "P_00001_LEFT_CC.npy"
+# -> "P_00001") -- zero patients found spanning more than one split
+# across the full 892-patient export this was checked against.
 MRI_CONFIG.patient_id_fn = default_patient_id_from_filename
+MAMMOGRAM_CONFIG.patient_id_fn = default_patient_id_from_filename
 
 
 def run_pipeline(config: DatasetConfig, args: argparse.Namespace) -> None:
