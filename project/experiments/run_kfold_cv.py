@@ -3,9 +3,13 @@ The full "optimize each model -> freeze -> cross-validate to compare"
 protocol, per your adviser's instruction:
 
   1. For each model, tune its bce_weight/dice_weight independently on a
-     single split (tuning.bayesian.tune_bce_dice_weight -- NOT k-fold CV;
-     see that module's docstring for why tuning and cross-validation are
-     kept separate and sequential rather than nested).
+     single split -- NOT k-fold CV; see tuning.bayesian's module
+     docstring for why tuning and cross-validation are kept separate and
+     sequential rather than nested. --tuning-method selects the search:
+     "grid" (default, tuning.grid_search -- deterministic sweep over
+     --alphas, per adviser feedback that Bayesian's convergence is
+     unpredictable) or "bayesian" (tuning.bayesian -- Optuna TPE over
+     --n-trials trials).
   2. Freeze that model's tuned weights.
   3. Run k-fold CV with those frozen weights (one fresh model per fold,
      training.trainer.run_kfold_training), reporting mean +/- std of
@@ -67,7 +71,8 @@ from cross_validation.folds import (
 )
 from models import MODEL_LABELS, MODEL_REGISTRY
 from training.trainer import run_kfold_training
-from tuning.bayesian import tune_bce_dice_weight
+from tuning import DEFAULT_TUNING_METHOD, TUNING_METHODS, tune_loss_weights
+from tuning.grid_search import DEFAULT_ALPHAS
 
 
 def run_kfold_cv(
@@ -141,6 +146,8 @@ def run_kfold_comparison(
     tuning_epochs: int = 5,
     epochs: int | None = None,
     fixed_weights: dict[str, tuple[float, float]] | None = None,
+    tuning_method: str = DEFAULT_TUNING_METHOD,
+    alphas: tuple[float, ...] = DEFAULT_ALPHAS,
 ) -> list[dict]:
     """
     Steps 1-4 of the protocol above: for every model in model_names,
@@ -167,8 +174,9 @@ def run_kfold_comparison(
                 f"bce_weight={bce_weight:.4f}, dice_weight={dice_weight:.4f}"
             )
         else:
-            bce_weight, dice_weight = tune_bce_dice_weight(
-                model_name, config, n_trials=n_trials, tuning_epochs=tuning_epochs,
+            bce_weight, dice_weight = tune_loss_weights(
+                tuning_method, model_name, config,
+                n_trials=n_trials, tuning_epochs=tuning_epochs, alphas=alphas,
             )
 
         fold_rows = run_kfold_cv(model_name, config, bce_weight, dice_weight, n_folds=n_folds, epochs=epochs)
@@ -229,12 +237,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument(
+        "--tuning-method", choices=TUNING_METHODS, default=DEFAULT_TUNING_METHOD,
+        help="'grid' (default): deterministic sweep over --alphas -- predictable, adviser-recommended "
+             "smokescreen. 'bayesian': Optuna TPE search over --n-trials trials (unpredictable convergence). "
+             "Ignored for any model given via --bce-weight/--dice-weight.",
+    )
+    parser.add_argument(
+        "--alphas", type=float, nargs="+", default=list(DEFAULT_ALPHAS),
+        help=f"Grid of bce_weight values to try (only used with --tuning-method grid). Default: {list(DEFAULT_ALPHAS)}",
+    )
+    parser.add_argument(
         "--n-trials", type=int, default=15,
-        help="Optuna trials per model during tuning (ignored for any model given via --bce-weight/--dice-weight).",
+        help="Optuna trials per model during tuning (--tuning-method bayesian only; "
+             "ignored for any model given via --bce-weight/--dice-weight).",
     )
     parser.add_argument(
         "--tuning-epochs", type=int, default=5,
-        help="Epochs per tuning trial (ignored for any model given via --bce-weight/--dice-weight).",
+        help="Epochs per tuning trial/grid point (ignored for any model given via --bce-weight/--dice-weight).",
     )
     parser.add_argument(
         "--epochs", type=int, default=None,
@@ -269,6 +288,7 @@ def main() -> None:
             args.models, config,
             n_folds=args.n_folds, n_trials=args.n_trials, tuning_epochs=args.tuning_epochs,
             epochs=args.epochs, fixed_weights=fixed_weights,
+            tuning_method=args.tuning_method, alphas=tuple(args.alphas),
         )
 
 

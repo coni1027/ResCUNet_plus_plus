@@ -15,6 +15,21 @@ an already-constructed model plus explicit paths/labels, and is used by:
                                (see tuning/bayesian.py and
                                experiments/run_kfold_cv.py).
 All three share the exact same loop, logging, and checkpoint format.
+
+Two checkpoints are kept per run, side by side:
+  - "..._best.pth" -- the epoch with the highest validation Dice so far.
+                      This is what gets loaded for final test-set
+                      evaluation and is the one you want for actually
+                      using/reporting the model.
+  - "..._last.pth" -- overwritten after EVERY epoch (model, optimizer,
+                      and LR-scheduler state), purely so a halted run can
+                      resume. run_training_loop() automatically resumes
+                      from "..._last.pth" if it exists when called again
+                      with the same checkpoint_path -- no separate
+                      --resume flag needed, since every entry point
+                      derives checkpoint_path from (config.name,
+                      model_name/label[, fold_idx]) the same way every
+                      time, so re-running the same command finds it.
 """
 
 from __future__ import annotations
@@ -39,8 +54,10 @@ def save_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.ReduceLROnPlateau,
     epoch: int,
     best_val_dice: float,
+    val_metrics: dict[str, float],
     config: DatasetConfig,
     label: str,
     bce_weight: float,
@@ -52,7 +69,9 @@ def save_checkpoint(
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "best_val_dice": best_val_dice,
+        "val_metrics": val_metrics,
         "dataset_name": config.name,
         "label": label,
         "input_size": config.input_size,
@@ -65,6 +84,20 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
+def last_checkpoint_path(checkpoint_path: Path) -> Path:
+    """
+    Derive the "resume" checkpoint's path from the "best" one, e.g.
+    ".../mri_resunetpp_cbam_best.pth" -> ".../mri_resunetpp_cbam_last.pth".
+    Every checkpoint_path in this codebase is built with a "_best.pth"
+    suffix (see train_model(), run_kfold_training(), run_ablation.py), so
+    the plain suffix swap below always applies; the fallback only
+    matters if a caller ever passes a differently-named path.
+    """
+    if checkpoint_path.name.endswith("_best.pth"):
+        return checkpoint_path.with_name(checkpoint_path.name[: -len("_best.pth")] + "_last.pth")
+    return checkpoint_path.with_name(checkpoint_path.stem + "_last" + checkpoint_path.suffix)
+
+
 def write_history(path: Path, history: list[dict[str, float]]) -> None:
     if not history:
         return
@@ -73,6 +106,23 @@ def write_history(path: Path, history: list[dict[str, float]]) -> None:
         writer = csv.DictWriter(file, fieldnames=list(history[0].keys()))
         writer.writeheader()
         writer.writerows(history)
+
+
+def load_history(path: Path) -> list[dict[str, float]]:
+    """Read back a history CSV written by write_history(), so a resumed
+    run can keep appending to the same in-memory list instead of
+    overwriting earlier epochs' rows with only the new ones."""
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        rows = []
+        for raw_row in reader:
+            rows.append({
+                key: int(value) if key == "epoch" else float(value)
+                for key, value in raw_row.items()
+            })
+        return rows
 
 
 def run_training_loop(
@@ -100,6 +150,13 @@ def run_training_loop(
     metrics are the *best epoch's validation* metrics rather than a true
     held-out test score. Omit `loaders` entirely (the default) to use
     config's fixed data/<name>/{train,val,test} split, exactly as before.
+
+    Resume: if last_checkpoint_path(checkpoint_path) already exists (a
+    previous call to this exact checkpoint_path was interrupted), model/
+    optimizer/scheduler state and the epoch counter are restored from it
+    before the loop starts, and history_path's existing rows are reloaded
+    so the CSV keeps growing instead of being overwritten from epoch 1.
+    Nothing else needs to change to resume -- re-run the same command.
     """
     if loaders is None:
         train_loader, val_loader, test_loader = create_loaders(config)
@@ -121,9 +178,25 @@ def run_training_loop(
         patience=3,
     )
 
+    start_epoch = 1
     best_val_dice = -1.0
     best_val_metrics: dict[str, float] | None = None
     history: list[dict[str, float]] = []
+
+    resume_path = last_checkpoint_path(checkpoint_path)
+    if resume_path.exists():
+        resume = torch.load(resume_path, map_location=DEVICE)
+        model.load_state_dict(resume["model_state_dict"])
+        optimizer.load_state_dict(resume["optimizer_state_dict"])
+        scheduler.load_state_dict(resume["scheduler_state_dict"])
+        start_epoch = resume["epoch"] + 1
+        best_val_dice = resume["best_val_dice"]
+        history = load_history(history_path)
+        print(
+            f"[{label}] Resuming from {resume_path}: "
+            f"starting at epoch {start_epoch}/{epochs} "
+            f"(best_val_dice so far: {best_val_dice:.4f})"
+        )
 
     print("=" * 80)
     print(f"Training: {config.name} | {label}")
@@ -132,7 +205,7 @@ def run_training_loop(
     print(f"Loss weights -> bce_weight={bce_weight:.4f}, dice_weight={dice_weight:.4f}")
     print("=" * 80)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         running_loss = 0.0
 
@@ -176,14 +249,38 @@ def run_training_loop(
             f"recall={val_metrics['recall']:.4f}"
         )
 
-        if val_metrics["dice"] > best_val_dice:
+        is_new_best = val_metrics["dice"] > best_val_dice
+        if is_new_best:
             best_val_dice = val_metrics["dice"]
             best_val_metrics = val_metrics
+
+        # Saved every epoch (overwriting the previous one) purely so a
+        # halted run can resume -- see last_checkpoint_path()'s docstring.
+        # best_val_dice/val_metrics here already reflect THIS epoch (the
+        # update above runs first), so a resume never re-derives a stale
+        # "best so far" that's one epoch behind.
+        save_checkpoint(
+            resume_path, model, optimizer, scheduler, epoch, best_val_dice,
+            val_metrics, config, label, bce_weight, dice_weight,
+            extra_fields=extra_checkpoint_fields,
+        )
+
+        if is_new_best:
             save_checkpoint(
-                checkpoint_path, model, optimizer, epoch, best_val_dice,
-                config, label, bce_weight, dice_weight, extra_fields=extra_checkpoint_fields,
+                checkpoint_path, model, optimizer, scheduler, epoch, best_val_dice,
+                val_metrics, config, label, bce_weight, dice_weight,
+                extra_fields=extra_checkpoint_fields,
             )
             print(f"  Saved new best checkpoint: {checkpoint_path}")
+
+    if best_val_metrics is None and checkpoint_path.exists():
+        # Either every epoch was already completed by a prior run (this
+        # call's loop above ran zero iterations), or epochs <= 0 was
+        # passed -- either way, recover the best metrics already on disk
+        # instead of leaving best_val_metrics unset.
+        existing_best = torch.load(checkpoint_path, map_location=DEVICE)
+        best_val_dice = existing_best["best_val_dice"]
+        best_val_metrics = existing_best["val_metrics"]
 
     if test_loader is not None:
         # Evaluate the best model on the held-out test split.

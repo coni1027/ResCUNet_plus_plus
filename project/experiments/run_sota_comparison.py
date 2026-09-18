@@ -7,18 +7,22 @@ comparison table of held-out test metrics.
 By default every model uses its DatasetConfig's fixed bce_weight/
 dice_weight (0.5/0.5) -- i.e. the comparison is controlled to isolate
 architecture differences, not confounded by seven different loss
-balances. Pass --tune-each to run Bayesian loss-weight tuning
-(tuning.bayesian.tune_bce_dice_weight, single split -- not cross-
-validated, see that module's docstring) separately for each model
-before training it, if you want every baseline to get its own
-best-effort loss balance too -- this adds roughly n_trials x
-tuning_epochs per model, on top of the training time itself.
+balances. Pass --tune-each to run loss-weight tuning (single split --
+not cross-validated) separately for each model before training it, if
+you want every baseline to get its own best-effort loss balance too.
+--tuning-method picks the search: "grid" (default, tuning.grid_search --
+deterministic sweep over --alphas) or "bayesian" (tuning.bayesian --
+Optuna TPE over --n-trials trials). See tuning/__init__.py and each
+module's docstring for the tradeoff. Either way this adds roughly
+(len(alphas) or n_trials) x tuning_epochs per model, on top of the
+training time itself.
 
 Usage:
   python experiments/run_sota_comparison.py --dataset mri
   python experiments/run_sota_comparison.py --dataset both --epochs 10        # quick smoke test
   python experiments/run_sota_comparison.py --dataset mri --models resunetpp_cbam unet resunet
   python experiments/run_sota_comparison.py --dataset mri --tune-each
+  python experiments/run_sota_comparison.py --dataset mri --tune-each --tuning-method bayesian
 """
 
 import argparse
@@ -31,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import DatasetConfig, MAMMOGRAM_CONFIG, MRI_CONFIG, RESULTS_DIR
 from models import MODEL_LABELS, MODEL_REGISTRY
 from training.trainer import train_model
-from tuning.bayesian import tune_bce_dice_weight
+from tuning import DEFAULT_TUNING_METHOD, TUNING_METHODS, tune_loss_weights
+from tuning.grid_search import DEFAULT_ALPHAS
 
 
 def run_comparison(
@@ -41,6 +46,8 @@ def run_comparison(
     tune_each: bool = False,
     n_trials: int = 15,
     tuning_epochs: int = 5,
+    tuning_method: str = DEFAULT_TUNING_METHOD,
+    alphas: tuple[float, ...] = DEFAULT_ALPHAS,
 ) -> list[dict]:
     rows = []
     for model_name in model_names:
@@ -49,8 +56,9 @@ def run_comparison(
 
         bce_weight = dice_weight = None
         if tune_each:
-            bce_weight, dice_weight = tune_bce_dice_weight(
-                model_name, config, n_trials=n_trials, tuning_epochs=tuning_epochs,
+            bce_weight, dice_weight = tune_loss_weights(
+                tuning_method, model_name, config,
+                n_trials=n_trials, tuning_epochs=tuning_epochs, alphas=alphas,
             )
 
         metrics = train_model(model_name, config, bce_weight=bce_weight, dice_weight=dice_weight, epochs=epochs)
@@ -88,13 +96,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tune-each", action="store_true",
         help=(
-            "Run Bayesian loss-weight tuning (single split) for EACH model before "
+            "Run loss-weight tuning (single split) for EACH model before "
             "training it, instead of using each DatasetConfig's fixed "
             "bce_weight/dice_weight for every model (the default, which "
             "keeps the comparison controlled to architecture differences)."
         ),
     )
-    parser.add_argument("--n-trials", type=int, default=15)
+    parser.add_argument(
+        "--tuning-method", choices=TUNING_METHODS, default=DEFAULT_TUNING_METHOD,
+        help="'grid' (default): deterministic sweep over --alphas -- predictable, adviser-recommended "
+             "smokescreen. 'bayesian': Optuna TPE search over --n-trials trials (unpredictable convergence). "
+             "Only used with --tune-each.",
+    )
+    parser.add_argument(
+        "--alphas", type=float, nargs="+", default=list(DEFAULT_ALPHAS),
+        help=f"Grid of bce_weight values to try (only used with --tuning-method grid). Default: {list(DEFAULT_ALPHAS)}",
+    )
+    parser.add_argument("--n-trials", type=int, default=15, help="--tuning-method bayesian only.")
     parser.add_argument("--tuning-epochs", type=int, default=5)
     return parser.parse_args()
 
@@ -108,6 +126,7 @@ def main() -> None:
     kwargs = dict(
         epochs=args.epochs, tune_each=args.tune_each,
         n_trials=args.n_trials, tuning_epochs=args.tuning_epochs,
+        tuning_method=args.tuning_method, alphas=tuple(args.alphas),
     )
     if args.dataset in ("mammogram", "both"):
         run_comparison(MAMMOGRAM_CONFIG, args.models, **kwargs)

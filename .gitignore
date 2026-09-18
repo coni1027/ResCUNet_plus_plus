@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Large/generated data and artifacts (transfer separately, don't commit)
+project/data/mammograms/
+project/data/raw/
+project/checkpoints/
+
+# Editor/OS cruft
+.vscode/
+.DS_Store
+Thumbs.db

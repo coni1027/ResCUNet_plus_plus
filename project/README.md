@@ -39,7 +39,9 @@ project/
 │   ├── evaluator.py              # metrics (Dice/IoU/precision/recall/accuracy), evaluate()
 │   └── trainer.py                 # shared training loop + registry-based train_model()
 ├── tuning/
-│   └── bayesian.py                # Bayesian (Optuna TPE) loss-weight tuning, single split
+│   ├── __init__.py                # tune_loss_weights() dispatcher: picks grid vs. bayesian
+│   ├── grid_search.py              # deterministic alpha-grid loss-weight tuning, single split (default)
+│   └── bayesian.py                # Bayesian (Optuna TPE) loss-weight tuning, single split (opt-in)
 └── experiments/
     ├── run_ablation.py            # leave-one-out ablation: all 5 methodology components
     ├── run_sota_comparison.py     # fixed-split, shared-weight comparison (cheaper, controlled, optional)
@@ -49,8 +51,14 @@ project/
 
 **Tuning and cross-validation are two separate, sequential stages, not
 nested, and there are two different comparison protocols available.**
-`tuning/bayesian.py` searches for the best BCE/Dice weight on a single
-fixed split. `experiments/run_kfold_cv.py` then either (a) trains one
+Loss-weight tuning searches for the best BCE/Dice weight on a single
+fixed split, via one of two interchangeable methods selected with
+`--tuning-method` (`tuning/__init__.py`'s `tune_loss_weights()`
+dispatcher): `grid` (default — `tuning/grid_search.py`, a deterministic
+sweep over `--alphas`, chosen per adviser feedback that Bayesian's
+convergence is unpredictable and hard to reason about in advance) or
+`bayesian` (`tuning/bayesian.py`, Optuna's TPE sampler, adaptive but with
+no guaranteed convergence point). `experiments/run_kfold_cv.py` then either (a) trains one
 model per cross-validation fold using an already-chosen, frozen weight
 for a single model, or (b) via `run_kfold_comparison()` / its CLI's
 default `--models` (all of them), runs the FULL "optimize each model →
@@ -144,11 +152,12 @@ late.
 ## Setup
 
 ```bash
-pip install torch torchvision optuna matplotlib pydicom
+pip install torch torchvision matplotlib pydicom
+pip install optuna  # only needed for --tuning-method bayesian (default is grid, no extra dependency)
 ```
 
 `pydicom` is only needed if your images are `.dcm`; `optuna` only for
-`--tune-loss-weights`; `matplotlib` only for the architecture diagram.
+`--tuning-method bayesian`; `matplotlib` only for the architecture diagram.
 
 ## Running
 
@@ -191,8 +200,9 @@ on both modalities with default settings.
 ```bash
 python -c "
 from config import MRI_CONFIG
-from tuning.bayesian import tune_bce_dice_weight
-print(tune_bce_dice_weight('resunetpp_cbam', MRI_CONFIG))
+from tuning import tune_loss_weights
+print(tune_loss_weights('grid', 'resunetpp_cbam', MRI_CONFIG))    # deterministic alpha grid (default)
+print(tune_loss_weights('bayesian', 'resunetpp_cbam', MRI_CONFIG))  # Optuna TPE search (opt-in)
 "
 ```
 
@@ -239,7 +249,8 @@ python experiments/run_sota_comparison.py --dataset mri --tune-each  # tune (sin
 
 **Quick smoke test of everything (few epochs, cheap tuning/folds, both modalities):**
 ```bash
-python experiments/run_all.py --dataset both --epochs 2 --n-trials 2 --tuning-epochs 1 --n-folds 2
+python experiments/run_all.py --dataset both --epochs 2 --tuning-epochs 1 --n-folds 2 --alphas 0.3 0.5 0.7  # default grid method, smaller grid
+python experiments/run_all.py --dataset both --epochs 2 --tuning-epochs 1 --n-folds 2 --tuning-method bayesian --n-trials 2  # bayesian instead
 ```
 
 **Architecture diagram (proposed model only, no GPU/data needed):**
@@ -254,13 +265,16 @@ codebase, by a wide margin. For `n_models` models (7 by default), it
 costs roughly:
 
 ```
-n_models x (n_trials x tuning_epochs + n_folds x config.epochs)
+n_models x (search_budget x tuning_epochs + n_folds x config.epochs)
 ```
 
-epoch-equivalents. With every default (7 models, 15 trials, 5 tuning
-epochs, 5 folds), that's `7 x (75 + 5 x config.epochs)` — e.g. at
-`config.epochs = 50`, roughly `7 x 325 = 2,275` epoch-equivalents,
-before the pipeline's train/ablation stages are even counted. The
+epoch-equivalents, where `search_budget` is `len(alphas)` (9 by default)
+for `--tuning-method grid` (the default) or `n_trials` (15 by default)
+for `--tuning-method bayesian`. With every default (7 models, grid
+search over 9 alphas, 5 tuning epochs, 5 folds), that's
+`7 x (45 + 5 x config.epochs)` — e.g. at `config.epochs = 50`, roughly
+`7 x 295 = 2,065` epoch-equivalents, before the pipeline's
+train/ablation stages are even counted. The
 ablation stage itself doubled in cost this round too: it's now 8
 variants instead of 4 (`8 x config.epochs` per dataset), since it
 covers all five methodology components instead of two. Compare all of
@@ -289,12 +303,17 @@ results.
 
 ## Caveats carried over from the tuning/CV work
 
-- Tuning (`tuning/bayesian.py`) is a cheap, single-split proxy (short
+- Tuning (`tuning/grid_search.py` default, or `tuning/bayesian.py` via
+  `--tuning-method bayesian`) is a cheap, single-split proxy (short
   `tuning_epochs`, one seed, one val split, alpha-only search space) —
-  see its module docstring for the full list. The k-fold CV step is
+  see each module's docstring for the full list. The k-fold CV step is
   what checks whether that choice of alpha is actually robust across
   different patients/slices; treat a tuned alpha as a good starting
-  point until the fold spread confirms it, not before.
+  point until the fold spread confirms it, not before. Grid search is
+  the default because its convergence is predictable and it gives you
+  the full Dice-vs-alpha curve to inspect directly; Bayesian search
+  stays available (`--tuning-method bayesian`) for a wider or continuous
+  search space where a fixed grid gets expensive.
 - Two different comparison protocols exist and answer different
   questions -- don't mix their numbers up in your write-up.
   `run_kfold_cv.py` (`run_kfold_comparison()`) tunes each model

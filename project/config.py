@@ -27,7 +27,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 RESULTS_DIR = BASE_DIR / "results"
-SPLITS_DIR = BASE_DIR / "splits"  # persisted CV fold assignments (see cross_validation/folds.py)
+SPLITS_DIR = BASE_DIR / "splits"    # persisted CV fold assignments (see cross_validation/folds.py)
+                                    # cross-validation split should be saved instead of randomly recreated every time
 
 MAMMOGRAM_ROOT = DATA_DIR / "mammograms"
 MRI_ROOT = DATA_DIR / "breast_mri"
@@ -113,7 +114,7 @@ MAMMOGRAM_CONFIG = DatasetConfig(
     input_size=(512, 512),
     in_channels=1,
     batch_size=4,
-    epochs=30,
+    epochs=50,
     learning_rate=1e-4,
     pretrained_encoder=False,
     deep_supervision=True,
@@ -139,7 +140,7 @@ MRI_CONFIG = DatasetConfig(
     input_size=(288, 288),
     in_channels=4,
     batch_size=8,
-    epochs=30,
+    epochs=50,
     learning_rate=1e-4,
     pretrained_encoder=False,
     deep_supervision=True,

@@ -1,9 +1,16 @@
 """
-Top-level orchestrator: (optionally) Bayesian-tune the proposed model's
-loss weights on a single split and train it on the fixed split, run the
+Top-level orchestrator: (optionally) tune the proposed model's loss
+weights on a single split and train it on the fixed split, run the
 CBAM/deep-supervision ablation, then run the full "optimize each model
 -> freeze -> cross-validate to compare" protocol across every registered
 model (the proposed model and all 6 baselines) -- in one command.
+
+Tuning defaults to --tuning-method grid (a deterministic sweep over
+--alphas, per adviser feedback that Bayesian's convergence is
+unpredictable); pass --tuning-method bayesian for the Optuna TPE search
+instead. See tuning/__init__.py's tune_loss_weights() dispatcher and
+tuning/grid_search.py / tuning/bayesian.py's module docstrings for the
+full tradeoff.
 
 Tuning and cross-validation are two separate, sequential stages
 throughout (tune first, then fold) rather than nested -- see
@@ -62,7 +69,8 @@ from experiments.run_ablation import ABLATION_VARIANTS, run_ablation
 from experiments.run_kfold_cv import run_kfold_comparison
 from models import MODEL_REGISTRY
 from training.trainer import train_model
-from tuning.bayesian import tune_bce_dice_weight
+from tuning import DEFAULT_TUNING_METHOD, TUNING_METHODS, tune_loss_weights
+from tuning.grid_search import DEFAULT_ALPHAS
 
 # Enable patient-safe CV grouping for RIDER by default in the full
 # pipeline (see module docstring above for how to verify this first).
@@ -76,8 +84,9 @@ def run_pipeline(config: DatasetConfig, args: argparse.Namespace) -> None:
     bce_weight = config.bce_weight
     dice_weight = config.dice_weight
     if args.tune_loss_weights:
-        bce_weight, dice_weight = tune_bce_dice_weight(
-            "resunetpp_cbam", config, n_trials=args.n_trials, tuning_epochs=args.tuning_epochs,
+        bce_weight, dice_weight = tune_loss_weights(
+            args.tuning_method, "resunetpp_cbam", config,
+            n_trials=args.n_trials, tuning_epochs=args.tuning_epochs, alphas=tuple(args.alphas),
         )
 
     if not args.skip_train:
@@ -95,6 +104,7 @@ def run_pipeline(config: DatasetConfig, args: argparse.Namespace) -> None:
             args.models, config,
             n_folds=args.n_folds, n_trials=args.n_trials, tuning_epochs=args.tuning_epochs,
             epochs=args.epochs, fixed_weights=fixed_weights,
+            tuning_method=args.tuning_method, alphas=tuple(args.alphas),
         )
 
 
@@ -113,8 +123,17 @@ def parse_args() -> argparse.Namespace:
         "--models", nargs="+", default=list(MODEL_REGISTRY), choices=sorted(MODEL_REGISTRY),
         help=f"Models included in the comparison stage. Defaults to ALL. Options: {sorted(MODEL_REGISTRY)}",
     )
-    parser.add_argument("--n-trials", type=int, default=15, help="Optuna trials per model during tuning.")
-    parser.add_argument("--tuning-epochs", type=int, default=5, help="Epochs per tuning trial.")
+    parser.add_argument(
+        "--tuning-method", choices=TUNING_METHODS, default=DEFAULT_TUNING_METHOD,
+        help="'grid' (default): deterministic sweep over --alphas -- predictable, adviser-recommended "
+             "smokescreen. 'bayesian': Optuna TPE search over --n-trials trials (unpredictable convergence).",
+    )
+    parser.add_argument(
+        "--alphas", type=float, nargs="+", default=list(DEFAULT_ALPHAS),
+        help=f"Grid of bce_weight values to try (only used when --tuning-method grid). Default: {list(DEFAULT_ALPHAS)}",
+    )
+    parser.add_argument("--n-trials", type=int, default=15, help="Optuna trials per model during tuning (--tuning-method bayesian only).")
+    parser.add_argument("--tuning-epochs", type=int, default=5, help="Epochs per tuning trial/grid point.")
     parser.add_argument("--n-folds", type=int, default=5, help="Folds for the comparison stage's cross-validation.")
     parser.add_argument("--epochs", type=int, default=None, help="Override every stage's epoch count.")
     parser.add_argument("--skip-train", action="store_true", help="Skip training the proposed model on the fixed split.")
