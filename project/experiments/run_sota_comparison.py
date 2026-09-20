@@ -17,6 +17,15 @@ module's docstring for the tradeoff. Either way this adds roughly
 (len(alphas) or n_trials) x tuning_epochs per model, on top of the
 training time itself.
 
+The comparison CSV (results/sota_comparison_<dataset>.csv) is updated,
+not overwritten: running this script again -- with a different --models
+subset, or just re-running one model -- merges its new row(s) into
+whatever's already in the file (matched by the "model" column), instead
+of replacing the whole table with only the models from that one run.
+Re-running the SAME model replaces its row with the fresh result; a
+model from an earlier run that isn't in this run's --models is left
+untouched. See update_comparison_csv().
+
 Usage:
   python experiments/run_sota_comparison.py --dataset mri
   python experiments/run_sota_comparison.py --dataset both --epochs 10        # quick smoke test
@@ -37,6 +46,55 @@ from models import MODEL_LABELS, MODEL_REGISTRY
 from training.trainer import train_model
 from tuning import DEFAULT_TUNING_METHOD, TUNING_METHODS, tune_loss_weights
 from tuning.grid_search import DEFAULT_ALPHAS
+
+
+def _load_existing_rows(path: Path) -> dict[str, dict]:
+    """
+    Read a previously written sota_comparison_<dataset>.csv, keyed by its
+    "model" column, so update_comparison_csv() can merge into it instead
+    of overwriting it. Returns {} if the file doesn't exist yet.
+
+    Every column except "model"/"label" is a float (see run_comparison()'s
+    row construction), so those are converted back on the way in --
+    otherwise a merged table mixing old (string, from CSV) and new (float,
+    fresh from train_model()) values in the same column would break the
+    ":.4f" formatting in the printed summary below.
+    """
+    if not path.exists():
+        return {}
+    with path.open(newline="", encoding="utf-8") as f:
+        rows: dict[str, dict] = {}
+        for raw_row in csv.DictReader(f):
+            row = {
+                key: value if key in ("model", "label") else float(value)
+                for key, value in raw_row.items()
+            }
+            rows[row["model"]] = row
+        return rows
+
+
+def update_comparison_csv(path: Path, new_rows: list[dict]) -> list[dict]:
+    """
+    Merge new_rows into path's existing comparison table, matched by the
+    "model" column: a model already in the file gets its row REPLACED
+    with the fresh result, a new model gets APPENDED, and any model from
+    an earlier run that isn't in new_rows is left untouched. This is what
+    lets you run this script once per model (or per subset) over several
+    sessions and end up with one combined table, instead of each run
+    wiping out every other model's result. Returns the full merged row
+    list that was actually written.
+    """
+    existing = _load_existing_rows(path)
+    for row in new_rows:
+        existing[row["model"]] = row
+    merged_rows = list(existing.values())
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(merged_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(merged_rows)
+    return merged_rows
 
 
 def run_comparison(
@@ -65,15 +123,11 @@ def run_comparison(
         rows.append({"model": model_name, "label": label, **metrics})
 
     out_path = RESULTS_DIR / f"sota_comparison_{config.name}.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\nSaved comparison table: {out_path}")
+    merged_rows = update_comparison_csv(out_path, rows)
+    print(f"\nSaved comparison table: {out_path} ({len(merged_rows)} model(s) total)")
 
     print(f"\n{'Model':<36} {'Dice':>8} {'IoU':>8} {'Precision':>10} {'Recall':>8} {'Accuracy':>9}")
-    for row in rows:
+    for row in merged_rows:
         print(
             f"{row['label']:<36} {row['dice']:>8.4f} {row['iou']:>8.4f} "
             f"{row['precision']:>10.4f} {row['recall']:>8.4f} {row['accuracy']:>9.4f}"

@@ -51,6 +51,11 @@ Usage:
   # one model, skip tuning -- use loss weights you already know
   python experiments/run_kfold_cv.py --dataset mri --models resunetpp_cbam --bce-weight 0.4 --dice-weight 0.6
 
+  # every model, reusing weights already tuned by an earlier "main training only"
+  # pass (e.g. run_sota_comparison.py --tune-each) instead of re-tuning here --
+  # a model with no saved checkpoint yet still gets tuned normally
+  python experiments/run_kfold_cv.py --dataset mri --reuse-tuned-weights
+
   # quick smoke test of the whole tune -> fold -> compare pipeline
   python experiments/run_kfold_cv.py --dataset mri --models unet resunet --n-folds 2 --epochs 2 --n-trials 2 --tuning-epochs 1
 """
@@ -61,9 +66,11 @@ import statistics
 import sys
 from pathlib import Path
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import DatasetConfig, MAMMOGRAM_CONFIG, MRI_CONFIG, RESULTS_DIR
+from config import CHECKPOINT_DIR, DatasetConfig, MAMMOGRAM_CONFIG, MRI_CONFIG, RESULTS_DIR
 from cross_validation.folds import (
     default_patient_id_from_filename,
     get_or_create_folds,
@@ -73,6 +80,26 @@ from models import MODEL_LABELS, MODEL_REGISTRY
 from training.trainer import run_kfold_training
 from tuning import DEFAULT_TUNING_METHOD, TUNING_METHODS, tune_loss_weights
 from tuning.grid_search import DEFAULT_ALPHAS
+
+
+def load_saved_weights(config: DatasetConfig, model_name: str) -> tuple[float, float] | None:
+    """
+    Read (bce_weight, dice_weight) back out of a previously saved
+    "..._best.pth" checkpoint for `model_name` on `config` -- e.g. one
+    written by an earlier training.trainer.train_model() run (whether via
+    experiments/run_sota_comparison.py --tune-each or
+    experiments/run_all.py --tune-loss-weights). This is what lets
+    --reuse-tuned-weights below carry a "main training only" pass's
+    already-tuned weights into a later, separate k-fold CV run instead of
+    tuning again from scratch. Returns None if no checkpoint exists yet
+    for this (config.name, model_name) pair, so the caller can fall back
+    to normal tuning for that model.
+    """
+    path = CHECKPOINT_DIR / f"{config.name}_{model_name}_best.pth"
+    if not path.exists():
+        return None
+    checkpoint = torch.load(path, map_location="cpu")
+    return checkpoint["bce_weight"], checkpoint["dice_weight"]
 
 
 def run_kfold_cv(
@@ -235,6 +262,18 @@ def parse_args() -> argparse.Namespace:
         "--dice-weight", type=float, default=None,
         help="Skip tuning and use this fixed Dice weight (only valid with exactly one --models entry).",
     )
+    parser.add_argument(
+        "--reuse-tuned-weights", action="store_true",
+        help=(
+            "For each model in --models, reuse the bce_weight/dice_weight already saved in "
+            "checkpoints/<dataset>_<model>_best.pth (e.g. from an earlier train_model() / "
+            "run_sota_comparison.py --tune-each / run_all.py --tune-loss-weights run) instead "
+            "of tuning again here -- skips tuning entirely for any model that already has a "
+            "saved checkpoint for this dataset; a model with no saved checkpoint yet still "
+            "gets tuned normally. Combine with --bce-weight/--dice-weight to override just "
+            "one model explicitly (that flag wins over a saved checkpoint for that model)."
+        ),
+    )
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument(
         "--tuning-method", choices=TUNING_METHODS, default=DEFAULT_TUNING_METHOD,
@@ -282,7 +321,12 @@ def main() -> None:
     if MAMMOGRAM_CONFIG.patient_id_fn is None:
         MAMMOGRAM_CONFIG.patient_id_fn = default_patient_id_from_filename
 
-    fixed_weights = {args.models[0]: (args.bce_weight, args.dice_weight)} if args.bce_weight is not None else None
+    # --bce-weight/--dice-weight always wins (see the "only one --models entry"
+    # check above); it's applied per-config below alongside any
+    # --reuse-tuned-weights lookups, since a saved checkpoint is dataset-specific.
+    manual_override = (
+        {args.models[0]: (args.bce_weight, args.dice_weight)} if args.bce_weight is not None else {}
+    )
 
     configs = {
         "mammogram": [MAMMOGRAM_CONFIG],
@@ -291,10 +335,24 @@ def main() -> None:
     }[args.dataset]
 
     for config in configs:
+        fixed_weights = dict(manual_override)
+        if args.reuse_tuned_weights:
+            for model_name in args.models:
+                if model_name in fixed_weights:
+                    continue  # --bce-weight/--dice-weight already covers this one
+                saved = load_saved_weights(config, model_name)
+                if saved is not None:
+                    fixed_weights[model_name] = saved
+                    print(
+                        f"[{config.name}/{model_name}] Reusing saved weights from "
+                        f"checkpoints/{config.name}_{model_name}_best.pth: "
+                        f"bce_weight={saved[0]:.4f}, dice_weight={saved[1]:.4f}"
+                    )
+
         run_kfold_comparison(
             args.models, config,
             n_folds=args.n_folds, n_trials=args.n_trials, tuning_epochs=args.tuning_epochs,
-            epochs=args.epochs, fixed_weights=fixed_weights,
+            epochs=args.epochs, fixed_weights=fixed_weights or None,
             tuning_method=args.tuning_method, alphas=tuple(args.alphas),
         )
 
