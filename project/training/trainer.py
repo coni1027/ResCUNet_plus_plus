@@ -30,6 +30,21 @@ Two checkpoints are kept per run, side by side:
                       derives checkpoint_path from (config.name,
                       model_name/label[, fold_idx]) the same way every
                       time, so re-running the same command finds it.
+
+checkpoint_path is derived only from (config.name, model_name/label[,
+fold_idx]) -- NOT from bce_weight/dice_weight or ablation flags. So two
+calls that reuse the same model_name/config but pass DIFFERENT
+hyperparameters (e.g. re-running experiments/run_kfold_cv.py with a
+different --bce-weight/--dice-weight, or re-tuning with a different
+--tuning-method) would otherwise collide on the same "..._last.pth" and
+silently resume across the mismatch -- continuing training under the
+OLD run's settings, or, if that old run had already finished, skipping
+training entirely and returning its stale metrics with no error.
+resume_mismatches() is the guard against this: before resuming,
+run_training_loop() checks the loaded checkpoint's bce_weight/
+dice_weight (and any extra_checkpoint_fields, e.g. ablation flags)
+against what THIS call was given, and starts fresh instead of resuming
+if anything differs.
 """
 
 from __future__ import annotations
@@ -98,6 +113,46 @@ def last_checkpoint_path(checkpoint_path: Path) -> Path:
     return checkpoint_path.with_name(checkpoint_path.stem + "_last" + checkpoint_path.suffix)
 
 
+def resume_mismatches(
+    resume: dict,
+    bce_weight: float,
+    dice_weight: float,
+    extra_checkpoint_fields: dict | None,
+) -> list[str]:
+    """
+    Compare a loaded "_last.pth" payload against the hyperparameters THIS
+    call was actually given, and return a human-readable mismatch per
+    differing field (empty list means safe to resume).
+
+    Why this check exists: checkpoint_path/last_checkpoint_path are
+    derived only from (config.name, model_name/label[, fold_idx]) --
+    never from bce_weight/dice_weight or ablation flags (see
+    last_checkpoint_path()'s docstring). So two calls that reuse the same
+    model_name/config but pass DIFFERENT loss weights -- e.g. re-running
+    experiments/run_kfold_cv.py with a different --bce-weight/
+    --dice-weight, or re-tuning with a different --tuning-method, or
+    simply re-tuning at all -- collide on the same checkpoint path.
+    Resuming across such a mismatch would silently continue training
+    under the OLD run's loss composition instead of the one just
+    requested, or -- if the old run had already finished -- skip training
+    entirely and return the old run's stale metrics with no error. This
+    check is what makes run_training_loop() refuse that and start fresh
+    instead whenever the checkpoint doesn't actually match this call.
+    """
+    mismatches = []
+    resume_bce = resume.get("bce_weight")
+    resume_dice = resume.get("dice_weight")
+    if resume_bce != bce_weight or resume_dice != dice_weight:
+        mismatches.append(
+            f"bce_weight/dice_weight: checkpoint has {resume_bce}/{resume_dice}, "
+            f"this call requests {bce_weight:.4f}/{dice_weight:.4f}"
+        )
+    for key, value in (extra_checkpoint_fields or {}).items():
+        if key in resume and resume[key] != value:
+            mismatches.append(f"{key}: checkpoint has {resume[key]!r}, this call requests {value!r}")
+    return mismatches
+
+
 def write_history(path: Path, history: list[dict[str, float]]) -> None:
     if not history:
         return
@@ -152,11 +207,16 @@ def run_training_loop(
     config's fixed data/<name>/{train,val,test} split, exactly as before.
 
     Resume: if last_checkpoint_path(checkpoint_path) already exists (a
-    previous call to this exact checkpoint_path was interrupted), model/
-    optimizer/scheduler state and the epoch counter are restored from it
-    before the loop starts, and history_path's existing rows are reloaded
-    so the CSV keeps growing instead of being overwritten from epoch 1.
-    Nothing else needs to change to resume -- re-run the same command.
+    previous call to this exact checkpoint_path was interrupted) AND its
+    bce_weight/dice_weight/extra_checkpoint_fields match what THIS call
+    was given (see resume_mismatches()), model/optimizer/scheduler state
+    and the epoch counter are restored from it before the loop starts,
+    and history_path's existing rows are reloaded so the CSV keeps
+    growing instead of being overwritten from epoch 1. Nothing else needs
+    to change to resume -- re-run the same command. If the checkpoint
+    exists but doesn't match (different loss weights, different ablation
+    flags, ...), it's ignored and training starts fresh instead, so a
+    stale checkpoint from an unrelated run is never silently continued.
     """
     if loaders is None:
         train_loader, val_loader, test_loader = create_loaders(config)
@@ -186,17 +246,27 @@ def run_training_loop(
     resume_path = last_checkpoint_path(checkpoint_path)
     if resume_path.exists():
         resume = torch.load(resume_path, map_location=DEVICE)
-        model.load_state_dict(resume["model_state_dict"])
-        optimizer.load_state_dict(resume["optimizer_state_dict"])
-        scheduler.load_state_dict(resume["scheduler_state_dict"])
-        start_epoch = resume["epoch"] + 1
-        best_val_dice = resume["best_val_dice"]
-        history = load_history(history_path)
-        print(
-            f"[{label}] Resuming from {resume_path}: "
-            f"starting at epoch {start_epoch}/{epochs} "
-            f"(best_val_dice so far: {best_val_dice:.4f})"
-        )
+        mismatches = resume_mismatches(resume, bce_weight, dice_weight, extra_checkpoint_fields)
+        if mismatches:
+            print(
+                f"[{label}] Found {resume_path}, but it doesn't match this call -- "
+                "starting fresh instead of resuming (see resume_mismatches()'s "
+                "docstring for why this matters):"
+            )
+            for mismatch in mismatches:
+                print(f"    {mismatch}")
+        else:
+            model.load_state_dict(resume["model_state_dict"])
+            optimizer.load_state_dict(resume["optimizer_state_dict"])
+            scheduler.load_state_dict(resume["scheduler_state_dict"])
+            start_epoch = resume["epoch"] + 1
+            best_val_dice = resume["best_val_dice"]
+            history = load_history(history_path)
+            print(
+                f"[{label}] Resuming from {resume_path}: "
+                f"starting at epoch {start_epoch}/{epochs} "
+                f"(best_val_dice so far: {best_val_dice:.4f})"
+            )
 
     print("=" * 80)
     print(f"Training: {config.name} | {label}")
