@@ -90,12 +90,12 @@ def run_kfold_cv(
     groups: list[str] | None = None
     if config.patient_id_fn is not None:
         groups = [config.patient_id_fn(image_path) for image_path, _ in samples]
-    elif config.name == "breast_mri":
+    else:
         print(
-            "WARNING: MRI_CONFIG.patient_id_fn is not set, so breast_mri CV "
-            "folds will be built per SLICE, not per patient. Section 3.2 of "
-            "the methodology requires RIDER splits at the patient level -- "
-            "set MRI_CONFIG.patient_id_fn (see "
+            f"WARNING: {config.name}'s patient_id_fn is not set, so its CV "
+            "folds will be built per SAMPLE, not per patient. Section 3.2 of "
+            "the methodology requires patient-level splits -- set "
+            f"{config.name}.patient_id_fn (see "
             "cross_validation.folds.default_patient_id_from_filename for a "
             "starting point) and check with "
             "cross_validation.folds.preview_cv_groups() before trusting this."
@@ -272,8 +272,15 @@ def main() -> None:
             "(each model needs its own tuned weights) -- omit them to tune every model listed."
         )
 
+    # Patient-safe by default for both datasets, matching run_all.py -- verified
+    # against RIDER's exported slice names and CBIS-DDSM's "<patient>_<side>_
+    # <view>" export (see prepare_mammograms_presplit.py and config.py's
+    # comment on MAMMOGRAM_CONFIG). Only backs off if a caller already set a
+    # different patient_id_fn before calling main() (e.g. a test or script).
     if MRI_CONFIG.patient_id_fn is None:
         MRI_CONFIG.patient_id_fn = default_patient_id_from_filename
+    if MAMMOGRAM_CONFIG.patient_id_fn is None:
+        MAMMOGRAM_CONFIG.patient_id_fn = default_patient_id_from_filename
 
     fixed_weights = {args.models[0]: (args.bce_weight, args.dice_weight)} if args.bce_weight is not None else None
 
