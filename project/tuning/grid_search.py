@@ -79,8 +79,17 @@ def tune_bce_dice_weight_grid(
     config: DatasetConfig,
     alphas: tuple[float, ...] = DEFAULT_ALPHAS,
     tuning_epochs: int = 5,
-) -> tuple[float, float]:
-    """See the module docstring for the full method description and caveats."""
+    return_history: bool = False,
+) -> tuple[float, float] | tuple[float, float, list[tuple[float, float]]]:
+    """
+    See the module docstring for the full method description and caveats.
+
+    return_history=True additionally returns the full (alpha, val_dice)
+    list for every grid point searched, e.g. for plotting a Dice-vs-alpha
+    curve -- otherwise only the winning pair survives past this call (see
+    tuning/__init__.py's tune_loss_weights(), which needs the plain
+    2-tuple to stay a drop-in match for tuning.bayesian's return value).
+    """
     if model_name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model_name {model_name!r}. Options: {sorted(MODEL_REGISTRY)}")
     if not alphas:
@@ -141,4 +150,6 @@ def tune_bce_dice_weight_grid(
         f"[{config.name}/{model_name}] Best alpha (bce_weight): {best_alpha:.4f} "
         f"(dice_weight={1.0 - best_alpha:.4f}) -> val_dice={best_dice:.4f} over {len(results)} grid point(s)"
     )
+    if return_history:
+        return best_alpha, 1.0 - best_alpha, results
     return best_alpha, 1.0 - best_alpha
