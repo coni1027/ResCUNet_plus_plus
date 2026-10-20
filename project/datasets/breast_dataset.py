@@ -1,6 +1,9 @@
 """
-Data loading, preprocessing, augmentation, and the PyTorch Dataset for
-breast lesion segmentation (mammograms + breast MRI slices).
+Data loading, augmentation, and the PyTorch Dataset for breast lesion
+segmentation (mammograms + breast MRI slices).
+
+Images must already be preprocessed (normalize -> mean filter -> CLAHE ->
+resize) by data_preparation/; this module only loads and augments them.
 
 Expected on-disk layout (per DatasetConfig.root, i.e. data/mammograms or
 data/breast_mri):
@@ -122,88 +125,6 @@ def load_array(path: Path) -> np.ndarray:
     return array.astype(np.float32)
 
 
-def normalize_percentile(
-    image: np.ndarray,
-    low_percentile: float,
-    high_percentile: float,
-) -> np.ndarray:
-    """Robustly normalize a medical image to [0, 1]."""
-    finite = image[np.isfinite(image)]
-    if finite.size == 0:
-        return np.zeros_like(image, dtype=np.float32)
-
-    low = np.percentile(finite, low_percentile)
-    high = np.percentile(finite, high_percentile)
-
-    if high <= low:
-        return np.zeros_like(image, dtype=np.float32)
-
-    image = np.clip(image, low, high)
-    image = (image - low) / (high - low)
-    return image.astype(np.float32)
-
-
-def preprocess_image(image: np.ndarray, config: DatasetConfig) -> np.ndarray:
-    """
-    Returns HxW or CxHxW floating-point data in [0, 1].
-
-    For multi-channel .npy MRI input, each channel is normalized independently.
-
-    NOTE: when clahe/median_filter is enabled, the [0,1] float image is
-    quantized to uint8 before CLAHE/median filtering (OpenCV requires 8-bit
-    input for these ops), then converted back to float. For 16-bit CBIS-DDSM
-    mammograms this discards most of the original bit depth in exchange for
-    CLAHE contrast enhancement -- a reasonable and common trade-off, but
-    worth stating explicitly if precision loss is ever questioned.
-    """
-    # Convert HWC NumPy arrays to CHW when they clearly contain channels.
-    if image.ndim == 3 and image.shape[-1] <= 8 and image.shape[0] > 8:
-        image = np.moveaxis(image, -1, 0)
-
-    if image.ndim == 3:
-        channels = []
-        for channel in image:
-            channel = normalize_percentile(
-                channel,
-                config.percentile_clip[0],
-                config.percentile_clip[1],
-            )
-            channels.append(channel)
-        image = np.stack(channels, axis=0)
-    elif image.ndim == 2:
-        image = normalize_percentile(
-            image,
-            config.percentile_clip[0],
-            config.percentile_clip[1],
-        )
-    else:
-        raise ValueError(f"Expected a 2D image or 3D channel array, got {image.shape}")
-
-    # CLAHE and median filtering are applied channel-wise.
-    if config.median_filter or config.clahe:
-        is_chw = image.ndim == 3
-        channels = image if is_chw else image[None, ...]
-        processed = []
-
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if config.clahe else None
-
-        for channel in channels:
-            channel_u8 = np.clip(channel * 255.0, 0, 255).astype(np.uint8)
-
-            if config.median_filter:
-                channel_u8 = cv2.medianBlur(channel_u8, 3)
-            if clahe is not None:
-                channel_u8 = clahe.apply(channel_u8)
-
-            processed.append(channel_u8.astype(np.float32) / 255.0)
-
-        image = np.stack(processed, axis=0)
-        if not is_chw:
-            image = image[0]
-
-    return image.astype(np.float32)
-
-
 def load_binary_mask(path: Path) -> np.ndarray:
     mask = load_array(path)
 
@@ -217,25 +138,6 @@ def load_binary_mask(path: Path) -> np.ndarray:
             mask = np.max(mask, axis=0) if mask.shape[0] <= 8 else np.max(mask, axis=-1)
 
     return (mask > 0).astype(np.float32)
-
-
-def resize_image(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    height, width = size
-
-    if image.ndim == 2:
-        return cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
-
-    # CHW
-    channels = [
-        cv2.resize(channel, (width, height), interpolation=cv2.INTER_LINEAR)
-        for channel in image
-    ]
-    return np.stack(channels, axis=0)
-
-
-def resize_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    height, width = size
-    return cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
 
 
 def apply_joint_augmentation(
@@ -342,11 +244,9 @@ class BreastSegmentationDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         image_path, mask_path = self.samples[index]
 
-        image = preprocess_image(load_array(image_path), self.config)
+        # Already normalized, filtered, CLAHE'd and resized by data_preparation/ -- only augment here.
+        image = load_array(image_path)
         mask = load_binary_mask(mask_path)
-
-        image = resize_image(image, self.config.input_size)
-        mask = resize_mask(mask, self.config.input_size)
 
         if self.augment:
             image, mask = apply_joint_augmentation(image, mask, self.config)
@@ -358,6 +258,11 @@ class BreastSegmentationDataset(Dataset):
             raise ValueError(
                 f"{image_path.name} has {image.shape[0]} channel(s), but "
                 f"{self.config.name} config expects {self.config.in_channels}."
+            )
+        if image.shape[1:] != self.config.input_size or mask.shape != self.config.input_size:
+            raise ValueError(
+                f"{image_path.name} is {image.shape[1:]}, but {self.config.name} config expects "
+                f"{self.config.input_size}. Re-run data_preparation/ for this size."
             )
 
         image_tensor = torch.from_numpy(np.ascontiguousarray(image)).float()

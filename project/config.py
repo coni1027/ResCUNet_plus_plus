@@ -72,7 +72,7 @@ class DatasetConfig:
 
     # Preprocessing
     clahe: bool = False
-    median_filter: bool = False
+    mean_filter: bool = False
     percentile_clip: tuple[float, float] = (1.0, 99.0)
 
     # Training augmentation
@@ -101,8 +101,8 @@ class DatasetConfig:
     patient_id_fn: Callable[[Path], str] | None = None
 
 
-# Mammograms retain more spatial detail, so this default uses 512x512.
-# Reduce to (256, 256) if GPU memory is limited.
+# 1024x1024 so small masses keep detail after downsampling from ~5000x3000.
+# Images are stretched to this square (no padding); see data_preparation/transform_thresholding.py.
 # NOTE: CBIS-DDSM patients can contribute multiple images (views/lesions),
 # e.g. "P_00001_LEFT_CC" and "P_00001_LEFT_MLO" are the same patient.
 # experiments/run_all.py sets patient_id_fn = default_patient_id_from_
@@ -112,7 +112,7 @@ class DatasetConfig:
 MAMMOGRAM_CONFIG = DatasetConfig(
     name="mammogram",
     root=MAMMOGRAM_ROOT,
-    input_size=(512, 512),
+    input_size=(1024, 1024),
     in_channels=1,
     batch_size=4,
     epochs=50,
@@ -120,7 +120,7 @@ MAMMOGRAM_CONFIG = DatasetConfig(
     pretrained_encoder=False,
     deep_supervision=True,
     clahe=True,
-    median_filter=True,
+    mean_filter=True,
     horizontal_flip_probability=0.5,
     rotation_degrees=10.0,
     translation_fraction=0.03,
@@ -139,14 +139,14 @@ MRI_CONFIG = DatasetConfig(
     name="breast_mri",
     root=MRI_ROOT,
     input_size=(288, 288),
-    in_channels=4,
+    in_channels=1,  # early anatomical reference only
     batch_size=8,
     epochs=50,
     learning_rate=1e-4,
     pretrained_encoder=False,
     deep_supervision=True,
-    clahe=False,
-    median_filter=False,
+    clahe=True,
+    mean_filter=True,
     horizontal_flip_probability=0.5,
     rotation_degrees=20.0,
     translation_fraction=0.08,

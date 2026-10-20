@@ -6,6 +6,8 @@ __pycache__/
 project/data/mammogram/
 project/data/mammograms/
 project/data/raw/
+project/data/MRI/
+project/data/mammograms_raw/
 project/checkpoints/
 
 # Editor/OS cruft
