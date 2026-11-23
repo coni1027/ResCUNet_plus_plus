@@ -17,7 +17,7 @@ Resizing and saving here (rather than at load time, which
 datasets/breast_dataset.py's resize_image() already does dynamically
 for any file format it reads) turns a ~5680x3728, 16-bit DICOM decode +
 resize into a cheap .npy load, repeated every epoch of training instead
-of once here -- same reasoning as prepare_mri.py's slice extraction.
+of once here -- same reasoning as prepare_mama_mia.py's slice extraction.
 Only the resize happens here; percentile normalization / CLAHE / median
 filtering still happen at load time via preprocess_image(), exactly as
 before -- applying them here too would double-process every sample.
@@ -176,7 +176,7 @@ def extract_case(
     target_size (image: linear, mask: nearest -- see
     datasets.breast_dataset.resize_image/resize_mask), and writes the
     pair out. Returns whether the mask is non-empty (informational
-    only -- nothing is filtered by it, matching prepare_mri.py).
+    only -- nothing is filtered by it).
     """
     image = load_dicom(whole_path)      # float32, MONOCHROME1-corrected
     mask = load_mask_dicom(roi_path)    # float32, raw (no inversion)

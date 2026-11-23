@@ -69,7 +69,10 @@ def pooled_trainval_samples(config: DatasetConfig) -> list[tuple[Path, Path]]:
 # -----------------------------------------------------------------------------
 
 _PATIENT_ID_PATTERN = re.compile(
-    r"(?P<patient>P[_-]?\d{3,}|RIDER[\s_-]?[A-Za-z0-9]+[_-]?\d+|\d{3,})",
+    # The MAMA-MIA alternative comes first and must stay there: without it,
+    # "NACT_68_slice042" would fall through to the bare-digits alternative
+    # and group by the SLICE number ("042") instead of the patient.
+    r"(?P<patient>(?:DUKE|ISPY1|ISPY2|NACT)_\d+|P[_-]?\d{3,}|\d{3,})",
     re.IGNORECASE,
 )
 
@@ -77,12 +80,14 @@ _PATIENT_ID_PATTERN = re.compile(
 def default_patient_id_from_filename(image_path: Path) -> str:
     """
     Best-effort patient/case ID guess from a filename -- a starting point
-    for grouped (patient-safe) CV folds, NOT a validated parser for CBIS-
-    DDSM's or your exported RIDER files' actual naming convention.
+    for grouped (patient-safe) CV folds, NOT a validated parser for every
+    possible naming convention.
 
     Intended to handle filenames along the lines of:
-      "Mass-Training_P_00016_LEFT_CC_1.png" -> "P_00016"
-      "RIDER-1023_slice014.png"             -> "RIDER-1023"
+      "DUKE_001_slice042.npy"               -> "DUKE_001"   (MAMA-MIA, see preparation/prepare_mama_mia.py)
+      "NACT_68_slice042.npy"                -> "NACT_68"
+      "ISPY1_1001_slice010.npy"             -> "ISPY1_1001"
+      "Mass-Training_P_00016_LEFT_CC_1.png" -> "P_00016"    (CBIS-DDSM)
       "1023_042.png"                        -> "1023"
 
     VERIFY this against your real filenames (e.g. via preview_cv_groups())
@@ -118,7 +123,7 @@ def make_group_folds(
     count (via a greedy fill-the-smallest-fold assignment), not just group
     count, since group sizes (slices per patient) can differ a lot. If
     `groups` is None, each sample is its own group (ordinary per-sample
-    K-fold) -- fine for i.i.d. data, but not patient-safe for RIDER.
+    K-fold) -- fine for i.i.d. data, but not patient-safe for MRI slices.
 
     Uses its own seeded numpy Generator, independent of the global
     torch/numpy/random seed set by config.set_seed(), so fold assignment
@@ -126,7 +131,7 @@ def make_group_folds(
     called later for model re-initialization.
 
     Returns fewer than `n_folds` folds if fewer than `n_folds` unique
-    groups exist (e.g. RIDER's ~4 non-test patients) -- this is how
+    groups exist (e.g. a tiny smoke-test subset) -- this is how
     leave-one-patient-out CV naturally falls out of a generic "K-fold"
     request once grouping is enabled.
     """

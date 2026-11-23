@@ -1,11 +1,11 @@
 """
 Shared utilities for this package's one-time data-preparation scripts
-(prepare_mri.py, prepare_mammograms.py): patient-level splitting, split
+(prepare_mama_mia.py, prepare_mammograms.py): patient-level splitting, split
 caching, a pre-flight safety check, and manifest writing.
 
 Nothing here is imported by the actual training pipeline -- these exist
 purely to turn raw downloaded data into the per-split, per-sample layout
-datasets/breast_dataset.py expects, once, before training starts.
+datasets_preprocessing/breast_dataset.py expects, once, before training starts.
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ def split_patients(
 ) -> dict[str, list[str]]:
     """
     Assigns every unique patient ID to exactly one named group in
-    `ratios` -- e.g. {"train": 0.6, "val": 0.2, "test": 0.2} for RIDER's
-    Methodology-3.2 split, or {"train": 0.8, "val": 0.2} for CBIS-DDSM's
-    train-set carve-out -- seeded for reproducibility.
+    `ratios` -- e.g. {"train": 0.8, "val": 0.2} for carving val out of
+    MAMA-MIA's official train split (per collection) or CBIS-DDSM's train
+    set -- seeded for reproducibility.
 
     Every group except the last gets round(n * its own ratio) patients;
     the LAST group (in dict insertion order) absorbs whatever remains,

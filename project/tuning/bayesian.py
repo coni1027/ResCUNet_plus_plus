@@ -49,7 +49,7 @@ Please read these caveats before trusting the result of this search:
    single-split estimate: it doesn't by itself say how sensitive that
    choice of alpha is to which patients/slices happen to land in val.
    That's what run_kfold_cv.py's spread across folds is for, especially
-   given RIDER's small patient count.
+   since a single val split is one draw of patients.
 3. This tunes only the BCE/Dice balance. It reuses whatever batch size,
    learning rate, augmentation, and input resolution are already
    hard-coded in each DatasetConfig -- those are not part of the search

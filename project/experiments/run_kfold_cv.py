@@ -312,7 +312,7 @@ def main() -> None:
         )
 
     # Patient-safe by default for both datasets, matching run_all.py -- verified
-    # against RIDER's exported slice names and CBIS-DDSM's "<patient>_<side>_
+    # against MAMA-MIA's "<CASE>_slice<###>" names and CBIS-DDSM's "<patient>_<side>_
     # <view>" export (see prepare_mammograms_presplit.py and config.py's
     # comment on MAMMOGRAM_CONFIG). Only backs off if a caller already set a
     # different patient_id_fn before calling main() (e.g. a test or script).

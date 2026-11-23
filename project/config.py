@@ -1,7 +1,7 @@
 """
 Shared configuration: paths, reproducibility, and per-dataset settings for
 the breast lesion segmentation project (mammograms via CBIS-DDSM, breast
-MRI slices via RIDER).
+DCE-MRI slices via MAMA-MIA).
 
 Every other module in this project imports from here. This module itself
 imports nothing project-local, to keep the dependency graph a clean tree
@@ -93,7 +93,7 @@ class DatasetConfig:
     # same patient/case lands in the same CV fold. Leave as None to fall
     # back to per-sample folds; run_kfold_cv() prints a warning when that
     # happens for breast_mri, since methodology section 3.2 requires
-    # RIDER splits at the patient level. Left unset here deliberately (see
+    # MRI splits at the patient level. Left unset here deliberately (see
     # experiments/run_all.py, which sets this for MRI_CONFIG before running
     # the pipeline) so importing this module never has an opinion on
     # whether the heuristic in cross_validation/folds.py has been verified
@@ -128,9 +128,14 @@ MAMMOGRAM_CONFIG = DatasetConfig(
 
 # MRI slices are trained in their own experiment. These defaults are intentionally
 # independent from the mammogram settings.
-# NOTE: RIDER provides only 5 patients. For Bayesian loss-weight tuning to
-# build patient-safe CV folds (rather than per-slice folds), set
-# patient_id_fn, e.g.:
+# Data: MAMA-MIA (DUKE, ISPY1, ISPY2, NACT), written into MRI_ROOT by
+# preparation/prepare_mama_mia.py. The collections have different numbers
+# of DCE phases (e.g. DUKE _0000.._0004, NACT _0000.._0002), so every case
+# is reduced to the three phases all of them have -- pre-contrast (_0000),
+# 1st post-contrast (_0001), 2nd post-contrast (_0002) -- which become the
+# 3 input channels, in that order. input_size is also the size
+# prepare_mama_mia.py resizes slices to (native in-plane size is 256-512).
+# For patient-safe CV folds set patient_id_fn, e.g.:
 #   from cross_validation.folds import default_patient_id_from_filename
 #   MRI_CONFIG.patient_id_fn = default_patient_id_from_filename
 # and verify the grouping with cross_validation.folds.preview_cv_groups()
@@ -138,15 +143,15 @@ MAMMOGRAM_CONFIG = DatasetConfig(
 MRI_CONFIG = DatasetConfig(
     name="breast_mri",
     root=MRI_ROOT,
-    input_size=(288, 288),
-    in_channels=4,
+    input_size=(256, 256),
+    in_channels=3,
     batch_size=8,
     epochs=50,
     learning_rate=1e-4,
     pretrained_encoder=False,
     deep_supervision=True,
     clahe=False,
-    median_filter=False,
+    mean_filter=False,
     horizontal_flip_probability=0.5,
     rotation_degrees=20.0,
     translation_fraction=0.08,

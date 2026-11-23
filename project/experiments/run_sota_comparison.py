@@ -102,11 +102,25 @@ def run_comparison(
     model_names: list[str],
     epochs: int | None = None,
     tune_each: bool = False,
+    tune_shared: bool = False,
     n_trials: int = 15,
     tuning_epochs: int = 5,
     tuning_method: str = DEFAULT_TUNING_METHOD,
     alphas: tuple[float, ...] = DEFAULT_ALPHAS,
 ) -> list[dict]:
+    if tune_each and tune_shared:
+        raise ValueError("tune_each and tune_shared are mutually exclusive.")
+
+    shared_weights: tuple[float, float] | None = None
+    if tune_shared:
+        print(
+            f"\n[{config.name}] Tuning bce/dice weight once against resunetpp_cbam, "
+            "then reusing that pair for every model in this comparison..."
+        )
+        shared_weights = tune_bce_dice_weight(
+            "resunetpp_cbam", config, n_trials=n_trials, tuning_epochs=tuning_epochs,
+        )
+
     rows = []
     for model_name in model_names:
         label = MODEL_LABELS.get(model_name, model_name)
@@ -118,6 +132,8 @@ def run_comparison(
                 tuning_method, model_name, config,
                 n_trials=n_trials, tuning_epochs=tuning_epochs, alphas=alphas,
             )
+        elif shared_weights is not None:
+            bce_weight, dice_weight = shared_weights
 
         metrics = train_model(model_name, config, bce_weight=bce_weight, dice_weight=dice_weight, epochs=epochs)
         rows.append({"model": model_name, "label": label, **metrics})
@@ -176,9 +192,11 @@ def main() -> None:
     unknown = set(args.models) - set(MODEL_REGISTRY)
     if unknown:
         raise SystemExit(f"Unknown model name(s): {sorted(unknown)}. Options: {sorted(MODEL_REGISTRY)}")
+    if args.tune_each and args.tune_shared:
+        raise SystemExit("Pass --tune-each or --tune-shared, not both.")
 
     kwargs = dict(
-        epochs=args.epochs, tune_each=args.tune_each,
+        epochs=args.epochs, tune_each=args.tune_each, tune_shared=args.tune_shared,
         n_trials=args.n_trials, tuning_epochs=args.tuning_epochs,
         tuning_method=args.tuning_method, alphas=tuple(args.alphas),
     )

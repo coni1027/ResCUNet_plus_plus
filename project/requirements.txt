@@ -5,5 +5,6 @@ opencv-python
 
 # Optional, only needed for specific paths (see README "Setup"):
 # pydicom     - only if your raw images are .dcm
+# nibabel     - only for preparation/prepare_mama_mia.py (reads MAMA-MIA .nii.gz; preinstalled on Colab)
 # optuna      - only for --tuning-method bayesian (default is grid)
 # matplotlib  - only for models/diagram.py's architecture diagram

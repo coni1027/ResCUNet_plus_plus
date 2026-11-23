@@ -1,7 +1,7 @@
 # Breast lesion segmentation: ResNet34 + U-Net++ + CBAM
 
 Binary breast lesion segmentation across two modalities (CBIS-DDSM
-mammograms, RIDER breast MRI slices), comparing the proposed model
+mammograms, MAMA-MIA breast DCE-MRI slices), comparing the proposed model
 against 6 published baselines.
 
 ## Project layout
@@ -11,7 +11,7 @@ project/
 ├── config.py                    # DatasetConfig, MAMMOGRAM_CONFIG, MRI_CONFIG, paths, seed
 ├── preprocessing/
 │   ├── common.py                # shared: patient splitting, split caching, manifest writing
-│   ├── prepare_mri.py            # ONE-TIME: raw RIDER volumes -> per-slice train/val/test layout
+│   ├── prepare_mama_mia.py       # ONE-TIME: MAMA-MIA NIfTI (3 DCE phases) -> per-slice train/val/test layout
 │   └── prepare_mammograms.py     # ONE-TIME: raw CBIS-DDSM Whole+ROI pairs -> resized train/val/test layout
 ├── data/
 │   ├── mammograms/{train,val,test}/{images,masks}/
@@ -97,25 +97,27 @@ anything under `data/` is ready for `datasets/breast_dataset.py` to
 read. Both scripts share `preprocessing/common.py` for patient
 splitting, split caching, and manifest writing.
 
-**RIDER MRI** ships as whole-patient volumes (image volumes shaped
-`(n_slices, 4, H, W)`, e.g. the `(60, 4, 288, 288)` you found), not the
-per-slice files the training pipeline reads:
+**MAMA-MIA breast DCE-MRI** (DUKE, ISPY1, ISPY2, NACT) ships as NIfTI:
+one 3D volume per DCE phase per case (`images/<CASE>/<CASE>_0000.nii.gz`
+= pre-contrast, `_0001` = 1st post-contrast, ...) plus one expert tumour
+mask per case (`segmentations/expert/`). Collections have different
+phase counts (DUKE `_0000`-`_0004`, NACT `_0000`-`_0002`), so every case
+is reduced to the three phases they all have -- `_0000`, `_0001`,
+`_0002` become input channels 0, 1, 2 (`MRI_CONFIG.in_channels = 3`).
+Run on Colab against the copy on Drive:
 
 ```bash
-python preprocessing/prepare_mri.py --dry-run   # prints the full plan, writes nothing
-python preprocessing/prepare_mri.py             # writes data/breast_mri/{train,val,test}/{images,masks}/
+python preparation/prepare_mama_mia.py --mama-mia-root /content/drive/MyDrive/thesis/data/MAMA-MIA --out-root /content/mama_mia_2d --dry-run
+python preparation/prepare_mama_mia.py --mama-mia-root /content/drive/MyDrive/thesis/data/MAMA-MIA --out-root /content/mama_mia_2d
 ```
 
-`prepare_mri.py`'s module docstring lists the exact raw-layout
-assumptions it makes (image/mask volumes mirrored under separate
-directory trees, patient ID recoverable from the parent folder or
-filename) — if your raw files don't match, `patient_id_from_path()`
-and `find_volume_pairs()` are the only two functions that need editing.
-The split happens once, per patient, before any slice is written, so no
-slice from one patient can ever leak into a different split from
-another slice of the same patient — and every slice is kept, including
-ones with an empty mask, per your answer on avoiding a positive-only
-bias.
+test = MAMA-MIA's official test split; val = 20% of the official train
+patients per collection; every slice of a patient stays in its split.
+All tumour slices are kept plus an equal number of tumour-free slices
+per case (`--background-ratio`, `-1` = all). The dry run checks every
+case and prints the plan and output size before anything is written --
+see the script's module docstring for the full design. The earlier
+RIDER experiments are archived under `archive/rider/`.
 
 **CBIS-DDSM mammograms** ship as four DICOM/PNG files per case (e.g.
 `P_00731 Right MLO {Whole,ROI,Zoomed}.dcm` plus a `.png` export).
@@ -183,8 +185,8 @@ preview_cv_groups(MRI_CONFIG, n_folds=5)
 "
 ```
 Do this before your first `--tune-loss-weights` run to confirm
-`default_patient_id_from_filename` actually parses your RIDER filenames
-correctly (it's a best-effort heuristic — see its docstring).
+`default_patient_id_from_filename` actually parses your MAMA-MIA slice
+filenames (`NACT_68_slice042.npy` -> `NACT_68`) correctly (it's a best-effort heuristic — see its docstring).
 
 **Full pipeline (tune → train → ablation → optimize-each-model → freeze → cross-validate to compare) for one modality:**
 ```bash
@@ -210,7 +212,7 @@ print(tune_loss_weights('bayesian', 'resunetpp_cbam', MRI_CONFIG))  # Optuna TPE
 ```bash
 python experiments/run_kfold_cv.py --dataset mri                                          # every registered model
 python experiments/run_kfold_cv.py --dataset mri --models resunetpp_cbam unet resunet     # cheaper subset
-python experiments/run_kfold_cv.py --dataset mri --n-folds 4                              # RIDER caps at 4 non-test patients anyway
+python experiments/run_kfold_cv.py --dataset mri --n-folds 3                              # fewer folds = cheaper
 ```
 Each model is tuned independently (single split), frozen, then k-fold
 CV'd with those frozen weights — so the comparison reflects every
@@ -324,10 +326,6 @@ results.
   differ?" `run_all.py` now runs the former by default (the
   adviser-specified protocol); the latter stays available standalone
   when the cheaper, controlled question is what you want instead.
-- RIDER's k-fold CV is capped at 4-fold (leave-one-patient-out) even
-  with correct grouping, since only 4 of its 5 patients are ever pooled
-  into train+val — `experiments/run_kfold_cv.py` prints a note about
-  this at runtime, and `--n-folds 4` makes it explicit up front.
 - `run_sota_comparison.py` uses a fixed 0.5/0.5 loss balance for every
   model by default (`--tune-each` to tune -- still single-split, no
   folds -- per model instead), specifically so architecture is the only

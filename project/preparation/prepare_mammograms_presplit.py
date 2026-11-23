@@ -152,7 +152,7 @@ def extract_pair(
     target_size (image: linear, mask: nearest), and writes the pair
     out as .npy under the same filename. Returns whether the mask is
     non-empty (informational only -- nothing is filtered by it,
-    matching prepare_mammograms.py / prepare_mri.py).
+    matching prepare_mammograms.py).
     """
     image = load_dicom(image_path)      # float32, MONOCHROME1-corrected
     mask = load_mask_dicom(mask_path)   # float32, raw (no inversion)

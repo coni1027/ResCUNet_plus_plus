@@ -32,7 +32,7 @@ inside the comparison stage regardless.
 
 This is the only file that opts MRI_CONFIG into patient-grouped CV folds
 by default (via default_patient_id_from_filename). Verify that heuristic
-actually matches your RIDER filenames first, e.g. from the project root:
+actually matches your MAMA-MIA slice filenames first, e.g. from the project root:
 
     from config import MRI_CONFIG
     from cross_validation.folds import default_patient_id_from_filename, preview_cv_groups
@@ -74,8 +74,10 @@ from tuning.grid_search import DEFAULT_ALPHAS
 
 # Enable patient-safe CV grouping by default in the full pipeline (see
 # module docstring above for how to verify this first). Verified for
-# both datasets' actual filenames: MRI against RIDER's exported slice
-# names, and mammogram against preprocessing/prepare_mammograms_presplit
+# both datasets' actual filenames: MRI against preparation/prepare_mama_mia
+# .py's "<CASE>_slice<###>.npy" output (e.g. "NACT_68_slice042.npy" ->
+# "NACT_68"; that script re-checks this for every case before writing),
+# and mammogram against preparation/prepare_mammograms_presplit
 # .py's "<patient>_<side>_<view>.npy" output (e.g. "P_00001_LEFT_CC.npy"
 # -> "P_00001") -- zero patients found spanning more than one split
 # across the full 892-patient export this was checked against.
