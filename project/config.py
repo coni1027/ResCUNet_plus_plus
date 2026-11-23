@@ -112,7 +112,7 @@ class DatasetConfig:
 MAMMOGRAM_CONFIG = DatasetConfig(
     name="mammogram",
     root=MAMMOGRAM_ROOT,
-    input_size=(512, 512),
+    input_size=(1024, 1024),
     in_channels=1,
     batch_size=4,
     epochs=50,
