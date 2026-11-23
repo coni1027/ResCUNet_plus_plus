@@ -106,7 +106,7 @@ Patient 004 -> test only
 [preparation/prepare_mama_mia.py](project/preparation/prepare_mama_mia.py) does the conversion, once:
 
 - **Split**: test = the official MAMA-MIA test split (`train_test_splits.csv`); val = 20% of the official train patients, drawn separately within each collection (`--val-frac`). Every slice of a patient goes to that patient's split.
-- **Slices**: volumes are reoriented and sliced axially; every tumour slice is kept plus an equal number of tumour-free slices from the same case (`--background-ratio`, `-1` = keep all). The few sagittal acquisitions are skipped unless `--include-sagittal`.
+- **Slices**: each volume is sliced in the plane it was acquired in -- axial for DUKE and ISPY2, sagittal for all of ISPY1 and NACT (235 cases) -- so no slice is a stretched reformat; `--axial-only` drops the sagittal cases instead. Every tumour slice is kept plus an equal number of tumour-free slices from the same case (`--background-ratio`, `-1` = keep all).
 - **Output**: `data/breast_mri/<split>/{images,masks}/<CASE>_slice<###>.npy` -- images `(3, 256, 256)` float16, masks `(256, 256)` uint8 -- plus `extraction_manifest.csv` and `patient_split.json`.
 
 It is meant to run on Google Colab against the copy on Drive. Always dry-run first -- it checks every case (phases present, shapes match, listed in the split file, filename parses back to the patient) and prints the plan and the output size without writing anything:

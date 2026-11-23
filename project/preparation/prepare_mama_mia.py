@@ -22,7 +22,8 @@ Input (the Synapse release, as downloaded to Google Drive):
   reorient to RAS, stack phases as channels -> (3, X, Y, Z)
       |
       v
-  pick axial slices: every slice with tumour + a seeded sample of the rest
+  slice along the acquisition axis (axial for DUKE/ISPY2, sagittal for
+  ISPY1/NACT): every slice with tumour + a seeded sample of the rest
       |
       v
   resize to MRI_CONFIG.input_size, save image/mask pairs, patient ID in filename
@@ -42,12 +43,17 @@ Design:
     each collection (so DUKE/ISPY1/ISPY2/NACT are all represented in val
     in their natural proportions), seeded. Every slice of a case goes to
     that case's split, so no patient crosses train/val/test.
-  - ORIENTATION. MAMA-MIA stores axial scans as LAS and its few sagittal
-    scans as PSR (MAMA-MIA paper, sec. II-D), with no resampling. Volumes
-    are reoriented to RAS and sliced along the superior axis, so every
-    slice is axial with anterior at the top. The sagittal cases (6 of
-    1,506 per the paper) would only give low-resolution axial reformats;
-    they are skipped unless --include-sagittal.
+  - ORIENTATION / PLANE. MAMA-MIA does no resampling and keeps each scan
+    in its acquisition plane: DUKE and ISPY2 are axial (stored LAS), ALL
+    of ISPY1 and NACT are sagittal (stored PSL/PSR) -- 235 of 1,506 cases
+    (MAMA-MIA paper, Table I). Each volume is reoriented to RAS and cut
+    along its ACQUISITION axis, so every slice keeps full in-plane
+    resolution: axial slices have anterior at the top, sagittal slices
+    superior at the top. (Re-cutting a sagittal 256x256x60 volume axially
+    would give 256x60 slices stretched to 256x256.) The training set is
+    therefore mixed-plane; the manifest's slice_plane column records which
+    plane each slice is. --axial-only drops the sagittal cases instead,
+    i.e. all of ISPY1 and NACT.
   - SLICES. All slices containing tumour are kept, plus
     --background-ratio x that many tumour-free slices from the same case
     (seeded per case, so --dry-run and the real run pick identical
@@ -127,7 +133,8 @@ class Case:
     # filled by inspect_case()
     shape: tuple[int, ...] | None = None
     axcodes: tuple[str, ...] | None = None
-    n_axial_slices: int = 0
+    slice_axis: int = 2                           # RAS axis the volume is cut along (= its acquisition axis)
+    n_slices: int = 0
     selected: list[int] = field(default_factory=list)
     lesion_slices: set[int] = field(default_factory=set)
 
@@ -338,21 +345,42 @@ def inspect_case(
     case.shape = shape
     case.axcodes = tuple(nib.aff2axcodes(mask_img.affine))
 
+    case.slice_axis = acquisition_axis(case.axcodes)
+    if case.slice_axis is None:
+        problems.append((case.case_id, f"can't tell the acquisition plane from orientation {''.join(case.axcodes)}"))
+        return
+
     mask = np.asanyarray(nib.as_closest_canonical(mask_img).dataobj) > 0      # (X, Y, Z), RAS
-    lesion_per_slice = mask.any(axis=(0, 1))
-    case.n_axial_slices = int(mask.shape[2])
+    in_plane = tuple(a for a in range(3) if a != case.slice_axis)
+    lesion_per_slice = mask.any(axis=in_plane)
+    case.n_slices = int(mask.shape[case.slice_axis])
     case.lesion_slices = set(int(z) for z in np.flatnonzero(lesion_per_slice))
     if not case.lesion_slices:
         warnings.append(f"{case.case_id}: expert mask is empty")
     case.selected = select_slices(lesion_per_slice, background_ratio, _case_rng(case.case_id, seed))
 
 
+# A volume's acquisition plane is its STORED third axis: MAMA-MIA keeps axial
+# scans as LAS (3rd axis S) and sagittal ones as PS? (3rd axis L or R).
+# After reorienting to RAS, that axis is 0 (L/R), 1 (A/P) or 2 (S/I).
+_RAS_AXIS = {"L": 0, "R": 0, "A": 1, "P": 1, "S": 2, "I": 2}
+PLANE_NAMES = {0: "sagittal", 1: "coronal", 2: "axial"}
+
+
+def acquisition_axis(axcodes: tuple[str, ...]) -> int | None:
+    return _RAS_AXIS.get(axcodes[2])
+
+
 def is_axial(case: Case) -> bool:
-    return case.axcodes is not None and case.axcodes[2] in ("S", "I")
+    return case.slice_axis == 2
 
 
 def _to_display(plane: np.ndarray) -> np.ndarray:
-    """(..., X, Y) RAS plane -> (..., rows=anterior..posterior, cols=X)."""
+    """
+    (..., a, b) RAS plane (the two in-plane axes, in RAS order) ->
+    (..., rows=b from high to low, cols=a). Axial (X, Y): anterior at the
+    top. Sagittal (Y, Z) and coronal (X, Z): superior at the top.
+    """
     return np.ascontiguousarray(np.swapaxes(plane, -1, -2)[..., ::-1, :])
 
 
@@ -373,9 +401,10 @@ def write_case(case: Case, out_root: Path, size: tuple[int, int], dtype: np.dtyp
     masks_out.mkdir(parents=True, exist_ok=True)
 
     rows = []
+    ax = case.slice_axis
     for z in case.selected:
-        image = resize_image(_to_display(volume[:, :, :, z]), size)                     # (3, H, W)
-        mask_slice = resize_mask(_to_display(mask[:, :, z]).astype(np.uint8), size)     # (H, W)
+        image = resize_image(_to_display(np.take(volume, z, axis=ax + 1)), size)                  # (3, H, W)
+        mask_slice = resize_mask(_to_display(np.take(mask, z, axis=ax)).astype(np.uint8), size)   # (H, W)
         filename = f"{case.case_id}_slice{z:03d}.npy"
         np.save(images_out / filename, image.astype(dtype))
         np.save(masks_out / filename, (mask_slice > 0).astype(np.uint8))
@@ -385,6 +414,7 @@ def write_case(case: Case, out_root: Path, size: tuple[int, int], dtype: np.dtyp
             "collection": case.collection,
             "split": case.split,
             "slice_idx": z,
+            "slice_plane": PLANE_NAMES[ax],
             "has_lesion": z in case.lesion_slices,
             "lesion_pixels": int((mask_slice > 0).sum()),
             "source_images": ";".join(str(p) for p in case.phase_paths),
@@ -421,8 +451,9 @@ def main() -> None:
                         help="Fraction of each collection's official-train patients moved to val.")
     parser.add_argument("--background-ratio", type=float, default=1.0,
                         help="Tumour-free slices kept per tumour slice, per case. -1 = keep every slice.")
-    parser.add_argument("--include-sagittal", action="store_true",
-                        help="Also slice the few sagittal acquisitions (as low-res axial reformats).")
+    parser.add_argument("--axial-only", action="store_true",
+                        help="Skip non-axial acquisitions (all of ISPY1 and NACT are sagittal) instead of "
+                             "slicing them in their own plane.")
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--limit-per-collection", type=int, default=None,
                         help="Only the first N cases of each collection -- smoke tests only.")
@@ -516,7 +547,7 @@ def main() -> None:
 
     problem_ids = {case_id for case_id, _ in problems}
     inspected = [c for c in ready if c.shape is not None and c.case_id not in problem_ids]
-    skipped_planes = [c for c in inspected if not is_axial(c) and not args.include_sagittal]
+    skipped_planes = [c for c in inspected if not is_axial(c) and args.axial_only]
     plan = [c for c in inspected if c not in skipped_planes]
 
     # 5. Report
@@ -532,14 +563,17 @@ def main() -> None:
                 continue
             n_sel = sum(len(c.selected) for c in group)
             n_les = sum(len(c.lesion_slices) for c in group)
-            n_all = sum(c.n_axial_slices for c in group)
+            n_all = sum(c.n_slices for c in group)
             totals.update(selected=n_sel, lesion=n_les, all=n_all)
             print(f"  {split:<6}{collection:<12}{len(group):>7}{n_sel:>9}{n_les:>9}{n_all:>12}")
     print(f"  {'total':<18}{len(plan):>7}{totals['selected']:>9}{totals['lesion']:>9}{totals['all']:>12}")
     print(f"\nEstimated output size: {_gb(totals['selected'] * per_slice_bytes)} "
           f"(keeping every slice instead: {_gb(totals['all'] * per_slice_bytes)})")
+    planes = Counter((c.collection, PLANE_NAMES[c.slice_axis]) for c in plan)
+    print("Slice plane per collection: " + ", ".join(
+        f"{col} {plane} {n}" for (col, plane), n in sorted(planes.items())))
     if skipped_planes:
-        print(f"Skipping {len(skipped_planes)} non-axial case(s) (use --include-sagittal to keep): "
+        print(f"Skipping {len(skipped_planes)} non-axial case(s) (--axial-only): "
               + ", ".join(f"{c.case_id}[{''.join(c.axcodes)}]" for c in skipped_planes))
 
     if warnings:
@@ -576,10 +610,12 @@ def main() -> None:
         split: sorted(c.case_id for c in plan if c.split == split) for split in SPLITS
     } | {
         "skipped_non_axial": sorted(c.case_id for c in skipped_planes),
+        "sagittal_or_coronal": sorted(c.case_id for c in plan if not is_axial(c)),
         "settings": {
             "phases": [f"_{k:04d}" for k in PHASES], "size": list(size), "dtype": args.dtype,
             "background_ratio": args.background_ratio, "val_frac": args.val_frac, "seed": args.seed,
             "collections": args.collections, "limit_per_collection": args.limit_per_collection,
+            "axial_only": args.axial_only,
         },
     }, indent=2))
 
