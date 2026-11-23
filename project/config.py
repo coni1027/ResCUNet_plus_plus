@@ -72,7 +72,7 @@ class DatasetConfig:
 
     # Preprocessing
     clahe: bool = False
-    median_filter: bool = False
+    mean_filter: bool = False
     percentile_clip: tuple[float, float] = (1.0, 99.0)
 
     # Training augmentation
@@ -120,7 +120,7 @@ MAMMOGRAM_CONFIG = DatasetConfig(
     pretrained_encoder=False,
     deep_supervision=True,
     clahe=True,
-    median_filter=True,
+    mean_filter=True,
     horizontal_flip_probability=0.5,
     rotation_degrees=10.0,
     translation_fraction=0.03,

@@ -59,7 +59,7 @@ from torch.utils.data import DataLoader, Subset
 
 from config import CHECKPOINT_DIR, DatasetConfig, DEVICE, NUM_WORKERS, RESULTS_DIR, SEED, set_seed
 from cross_validation.folds import pooled_trainval_samples
-from datasets.breast_dataset import BreastSegmentationDataset, create_loaders
+from datasets_preprocessing.breast_dataset import BreastSegmentationDataset, create_loaders
 from models import MODEL_LABELS, MODEL_REGISTRY
 from training.evaluator import evaluate
 from training.losses import BCEDiceLoss, DeepSupervisionLoss

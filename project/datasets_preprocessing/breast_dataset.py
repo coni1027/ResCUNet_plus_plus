@@ -180,7 +180,7 @@ def preprocess_image(image: np.ndarray, config: DatasetConfig) -> np.ndarray:
         raise ValueError(f"Expected a 2D image or 3D channel array, got {image.shape}")
 
     # CLAHE and median filtering are applied channel-wise.
-    if config.median_filter or config.clahe:
+    if config.mean_filter or config.clahe:
         is_chw = image.ndim == 3
         channels = image if is_chw else image[None, ...]
         processed = []
@@ -188,10 +188,10 @@ def preprocess_image(image: np.ndarray, config: DatasetConfig) -> np.ndarray:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if config.clahe else None
 
         for channel in channels:
-            channel_u8 = np.clip(channel * 255.0, 0, 255).astype(np.uint8)
+            channel_u8 = np.rint(np.clip(channel * 255.0, 0, 255)).astype(np.uint8)
 
-            if config.median_filter:
-                channel_u8 = cv2.medianBlur(channel_u8, 3)
+            if config.mean_filter:
+                channel_u8 = cv2.blur(channel_u8, (3, 3))
             if clahe is not None:
                 channel_u8 = clahe.apply(channel_u8)
 

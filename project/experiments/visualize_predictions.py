@@ -31,7 +31,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import CHECKPOINT_DIR, DatasetConfig, DEVICE, MAMMOGRAM_CONFIG, MRI_CONFIG, RESULTS_DIR
-from datasets.breast_dataset import BreastSegmentationDataset
+from datasets_preprocessing.breast_dataset import BreastSegmentationDataset
 from models import MODEL_LABELS, MODEL_REGISTRY
 from training.evaluator import batch_metrics
 from training.losses import final_logits

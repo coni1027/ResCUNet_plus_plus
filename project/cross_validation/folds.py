@@ -26,7 +26,7 @@ from typing import Sequence
 import numpy as np
 
 from config import DatasetConfig, SEED, SPLITS_DIR
-from datasets.breast_dataset import BreastSegmentationDataset, paired_samples
+from datasets_preprocessing.breast_dataset import BreastSegmentationDataset, paired_samples
 
 
 # -----------------------------------------------------------------------------
