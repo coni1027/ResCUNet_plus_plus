@@ -59,7 +59,7 @@ from __future__ import annotations
 from torch import optim
 
 from config import DatasetConfig, DEVICE, SEED, set_seed
-from datasets.breast_dataset import create_loaders
+from datasets_preprocessing.breast_dataset import create_loaders
 from models import MODEL_REGISTRY
 from training.evaluator import evaluate
 from training.losses import BCEDiceLoss, DeepSupervisionLoss
