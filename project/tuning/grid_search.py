@@ -52,13 +52,22 @@ Please read these caveats before trusting the result of this search:
    every grid point is a value you explicitly asked about, not a
    sampler's guess to abandon early. Keep the grid small (a handful of
    points, not a fine sweep) if this needs to stay a "smokescreen."
+
+Every grid point is also written to a CSV (default:
+results/<dataset>_<model>_grid_search.csv), rewritten after each point so
+an interrupted search keeps what it finished: alpha, its val Dice after
+every epoch, how long it took, and which point won.
 """
 
 from __future__ import annotations
 
+import csv
+import time
+from pathlib import Path
+
 from torch import optim
 
-from config import DatasetConfig, DEVICE, SEED, set_seed
+from config import DatasetConfig, DEVICE, RESULTS_DIR, SEED, set_seed
 from datasets_preprocessing.breast_dataset import create_loaders
 from models import MODEL_REGISTRY
 from training.evaluator import evaluate
@@ -74,12 +83,26 @@ from training.losses import BCEDiceLoss, DeepSupervisionLoss
 DEFAULT_ALPHAS: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
 
+def write_grid_csv(rows: list[dict], path: Path, tuning_epochs: int) -> None:
+    """One row per grid point: alpha, final val Dice, val Dice per epoch, duration, best flag."""
+    best_alpha = max(rows, key=lambda r: r["val_dice"])["bce_weight"] if rows else None
+    epoch_columns = [f"val_dice_epoch{e}" for e in range(1, tuning_epochs + 1)]
+    fieldnames = ["bce_weight", "dice_weight", "is_best", "val_dice", *epoch_columns, "duration_s"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({**row, "is_best": row["bce_weight"] == best_alpha})
+
+
 def tune_bce_dice_weight_grid(
     model_name: str,
     config: DatasetConfig,
     alphas: tuple[float, ...] = DEFAULT_ALPHAS,
     tuning_epochs: int = 5,
     return_history: bool = False,
+    results_csv: Path | None = None,
 ) -> tuple[float, float] | tuple[float, float, list[tuple[float, float]]]:
     """
     See the module docstring for the full method description and caveats.
@@ -89,7 +112,13 @@ def tune_bce_dice_weight_grid(
     curve -- otherwise only the winning pair survives past this call (see
     tuning/__init__.py's tune_loss_weights(), which needs the plain
     2-tuple to stay a drop-in match for tuning.bayesian's return value).
+
+    results_csv: where to save the per-point results (default:
+    RESULTS_DIR/<dataset>_<model>_grid_search.csv).
     """
+    if results_csv is None:
+        results_csv = RESULTS_DIR / f"{config.name}_{model_name}_grid_search.csv"
+    results_csv = Path(results_csv)
     if model_name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model_name {model_name!r}. Options: {sorted(MODEL_REGISTRY)}")
     if not alphas:
@@ -106,10 +135,13 @@ def tune_bce_dice_weight_grid(
     )
 
     results: list[tuple[float, float]] = []  # (alpha, val_dice)
+    csv_rows: list[dict] = []
     for alpha in alphas:
         if not 0.0 <= alpha <= 1.0:
             raise ValueError(f"Each alpha must be in [0, 1], got {alpha}.")
 
+        started = time.monotonic()
+        per_epoch: dict[str, float] = {}
         set_seed(SEED)
         model = MODEL_REGISTRY[model_name](config)
 
@@ -122,7 +154,7 @@ def tune_bce_dice_weight_grid(
         )
 
         val_dice = 0.0
-        for _epoch in range(1, tuning_epochs + 1):
+        for epoch in range(1, tuning_epochs + 1):
             model.train()
             for images, masks in train_loader:
                 images = images.to(DEVICE, non_blocking=True)
@@ -136,9 +168,19 @@ def tune_bce_dice_weight_grid(
 
             val_metrics = evaluate(model, val_loader, criterion, DEVICE)
             val_dice = val_metrics["dice"]
+            per_epoch[f"val_dice_epoch{epoch}"] = val_dice
 
         results.append((alpha, val_dice))
-        print(f"  alpha={alpha:.2f} (bce={alpha:.2f}/dice={1.0 - alpha:.2f}) -> val_dice={val_dice:.4f}")
+        duration = time.monotonic() - started
+        csv_rows.append({
+            "bce_weight": alpha, "dice_weight": 1.0 - alpha, "val_dice": val_dice,
+            **per_epoch, "duration_s": round(duration, 1),
+        })
+        write_grid_csv(csv_rows, results_csv, tuning_epochs)
+        print(
+            f"  alpha={alpha:.2f} (bce={alpha:.2f}/dice={1.0 - alpha:.2f}) -> val_dice={val_dice:.4f}"
+            f"  [{duration / 60:.1f} min]"
+        )
 
     best_alpha, best_dice = max(results, key=lambda pair: pair[1])
 
@@ -148,7 +190,8 @@ def tune_bce_dice_weight_grid(
         print(f"  alpha={alpha:.2f}  val_dice={val_dice:.4f}{marker}")
     print(
         f"[{config.name}/{model_name}] Best alpha (bce_weight): {best_alpha:.4f} "
-        f"(dice_weight={1.0 - best_alpha:.4f}) -> val_dice={best_dice:.4f} over {len(results)} grid point(s)"
+        f"(dice_weight={1.0 - best_alpha:.4f}) -> val_dice={best_dice:.4f} over {len(results)} grid point(s) "
+        f"(per-point results: {results_csv})"
     )
     if return_history:
         return best_alpha, 1.0 - best_alpha, results
