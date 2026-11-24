@@ -11,7 +11,9 @@ imports nothing project-local, to keep the dependency graph a clean tree
 
 from __future__ import annotations
 
+import os
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -38,7 +40,14 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_WORKERS = 0  # safest default on Windows
+# DataLoader worker processes. Loading + preprocessing (CLAHE, mean filter,
+# resize, augmentation) runs on the CPU; with workers it overlaps GPU compute
+# instead of stalling it. 0 (load in the main process) on Windows, where
+# workers are spawned rather than forked and often slower or fragile; up to 8
+# elsewhere (e.g. Colab). Override with the NUM_WORKERS environment variable.
+NUM_WORKERS = int(os.environ.get(
+    "NUM_WORKERS", 0 if sys.platform == "win32" else min(8, os.cpu_count() or 1)
+))
 SEED = 42
 
 IMAGE_EXTENSIONS = {

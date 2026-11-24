@@ -59,9 +59,18 @@ Please read these caveats before trusting the result of this search:
    random-init noise. The result has still only been checked for one
    seed; consider re-running with 2-3 different seeds before trusting a
    close call.
+
+Every trial is also written to a CSV (default:
+results/<dataset>_<model>_tuning_trials.csv), rewritten after each trial
+so an interrupted search keeps what it finished: the bce_weight tried,
+whether it completed or was pruned, its val Dice after every epoch it
+ran, and which trial was best.
 """
 
 from __future__ import annotations
+
+import csv
+from pathlib import Path
 
 from torch import optim
 
@@ -70,11 +79,48 @@ try:
 except ImportError:  # Optuna is optional unless this module is used.
     optuna = None
 
-from config import DatasetConfig, DEVICE, SEED, set_seed
+from config import DatasetConfig, DEVICE, RESULTS_DIR, SEED, set_seed
 from datasets_preprocessing.breast_dataset import create_loaders
 from models import MODEL_REGISTRY
 from training.evaluator import evaluate
 from training.losses import BCEDiceLoss, DeepSupervisionLoss
+
+
+def write_trials_csv(study: "optuna.Study", path: Path, tuning_epochs: int) -> None:
+    """One row per trial: alpha, state (COMPLETE/PRUNED/FAIL), val Dice per epoch, best flag."""
+    try:
+        best_number = study.best_trial.number
+    except ValueError:  # no completed trial yet
+        best_number = None
+
+    epoch_columns = [f"val_dice_epoch{e}" for e in range(1, tuning_epochs + 1)]
+    fieldnames = [
+        "trial", "bce_weight", "dice_weight", "state", "is_best",
+        "val_dice", "epochs_run", "last_val_dice", *epoch_columns, "duration_s",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for trial in study.trials:
+            alpha = trial.params.get("bce_weight")
+            per_epoch = trial.intermediate_values  # {epoch: val_dice}
+            row = {
+                "trial": trial.number,
+                "bce_weight": alpha,
+                "dice_weight": None if alpha is None else 1.0 - alpha,
+                "state": trial.state.name,
+                "is_best": trial.number == best_number,
+                # Final objective value, completed trials only. (Optuna also stores the last
+                # reported value on pruned trials; that's last_val_dice below.)
+                "val_dice": trial.value if trial.state.name == "COMPLETE" else None,
+                "epochs_run": len(per_epoch),
+                "last_val_dice": per_epoch[max(per_epoch)] if per_epoch else None,
+                "duration_s": None if trial.duration is None else round(trial.duration.total_seconds(), 1),
+            }
+            for epoch, value in per_epoch.items():
+                row[f"val_dice_epoch{epoch}"] = value
+            writer.writerow(row)
 
 
 def tune_bce_dice_weight(
@@ -83,8 +129,13 @@ def tune_bce_dice_weight(
     n_trials: int = 15,
     tuning_epochs: int = 5,
     timeout: int | None = None,
+    trials_csv: Path | None = None,
 ) -> tuple[float, float]:
-    """See the module docstring for the full method description and caveats."""
+    """See the module docstring for the full method description and caveats.
+
+    trials_csv: where to save the per-trial results (default:
+    RESULTS_DIR/<dataset>_<model>_tuning_trials.csv).
+    """
     if optuna is None:
         raise ImportError(
             "optuna is required for Bayesian optimization of the loss weights. "
@@ -145,12 +196,29 @@ def tune_bce_dice_weight(
         f"{total_epoch_equivalents} epoch-equivalents before pruning "
         "(MedianPruner will cut many unpromising trials short)..."
     )
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    if trials_csv is None:
+        trials_csv = RESULTS_DIR / f"{config.name}_{model_name}_tuning_trials.csv"
+    trials_csv = Path(trials_csv)
+
+    def log_trial(study: "optuna.Study", trial: "optuna.trial.FrozenTrial") -> None:
+        # Optuna logs trials to stderr; print them too so they reach stdout logs.
+        alpha = trial.params.get("bce_weight", float("nan"))
+        per_epoch = trial.intermediate_values
+        last = per_epoch[max(per_epoch)] if per_epoch else float("nan")
+        print(
+            f"[{config.name}/{model_name}] trial {trial.number}: bce_weight={alpha:.4f} "
+            f"{trial.state.name.lower()} after {len(per_epoch)} epoch(s), val_dice={last:.4f}"
+        )
+        write_trials_csv(study, trials_csv, tuning_epochs)
+
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, callbacks=[log_trial])
+    write_trials_csv(study, trials_csv, tuning_epochs)
 
     best_alpha = study.best_params["bce_weight"]
     print(
         f"[{config.name}/{model_name}] Best alpha (bce_weight) found: "
         f"{best_alpha:.4f} (dice_weight={1.0 - best_alpha:.4f}) -> "
-        f"val_dice={study.best_value:.4f} over {len(study.trials)} trials"
+        f"val_dice={study.best_value:.4f} over {len(study.trials)} trials "
+        f"(per-trial results: {trials_csv})"
     )
     return best_alpha, 1.0 - best_alpha
